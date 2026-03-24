@@ -46,25 +46,49 @@ import json
 import tempfile
 import textwrap
 import re
+import traceback
 from pathlib import Path
 from io import BytesIO
 
 import streamlit as st
 
+# Load local .env (useful for OPENAI_API_KEY during development).
+try:
+    from dotenv import load_dotenv
+
+    load_dotenv()
+except Exception:
+    pass
+
 # ── optional imports with graceful error messages ──────────────────────────────
 try:
     import openai
-except ImportError:
+    OPENAI_IMPORT_ERROR = None
+except ImportError as e:
     openai = None
+    OPENAI_IMPORT_ERROR = str(e)
 
 try:
     from langchain_openai import OpenAIEmbeddings, ChatOpenAI
     from langchain_community.vectorstores import FAISS
-    from langchain.text_splitter import RecursiveCharacterTextSplitter
-    from langchain.schema import SystemMessage, HumanMessage
+    try:
+        # Newer LangChain splits text splitters into a dedicated package.
+        from langchain_text_splitters import RecursiveCharacterTextSplitter
+    except ImportError:
+        # Older LangChain versions keep splitters under `langchain.text_splitter`.
+        from langchain.text_splitter import RecursiveCharacterTextSplitter
+    try:
+        # Newer LangChain versions expose messages via langchain_core.
+        from langchain_core.messages import SystemMessage, HumanMessage
+    except ImportError:
+        # Backwards-compatible fallback.
+        from langchain.schema import SystemMessage, HumanMessage
+
     LANGCHAIN_OK = True
-except ImportError:
+    LANGCHAIN_IMPORT_ERROR = None
+except ImportError as e:
     LANGCHAIN_OK = False
+    LANGCHAIN_IMPORT_ERROR = str(e)
 
 try:
     import PyPDF2
@@ -331,10 +355,10 @@ OUTPUT FORMAT — Return ONLY valid JSON, no markdown fences:
 
 def get_api_key() -> str:
     """Retrieve OpenAI key from env or Streamlit secrets."""
-    key = os.getenv("OPENAI_API_KEY", "")
+    key = os.getenv("OPENAI_API_KEY", "").strip()
     if not key:
         try:
-            key = st.secrets.get("OPENAI_API_KEY", "")
+            key = (st.secrets.get("OPENAI_API_KEY", "") or "").strip()
         except Exception:
             pass
     return key
@@ -419,23 +443,54 @@ def transcribe_audio(audio_bytes: bytes, api_key: str, filename: str = "lecture.
         st.error("openai package not installed. Run: pip install openai")
         return ""
 
+    api_key = (api_key or "").strip()
+    if not api_key:
+        raise ValueError(
+            "OpenAI API key is empty. Set `OPENAI_API_KEY` or enter your key in the sidebar."
+        )
+
     client = openai.OpenAI(api_key=api_key)
 
     suffix = Path(filename).suffix or ".mp3"
+    tmp_path = None
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
         tmp.write(audio_bytes)
         tmp_path = tmp.name
-
     try:
         with open(tmp_path, "rb") as audio_file:
             response = client.audio.transcriptions.create(
                 model="whisper-1",
                 file=audio_file,
-                response_format="text",   # plain text — fastest for MVP
+                response_format="text",  # plain text — fastest for MVP
             )
         return response
+    except Exception as e:
+        # Surface the underlying OpenAI exception (network vs auth vs status).
+        detail_parts = [f"{type(e).__name__}: {e}"]
+        detail_parts.append(f"API key length: {len(api_key)}")
+        resp = getattr(e, "response", None)
+        if resp is not None:
+            try:
+                detail_parts.append(f"Response status: {getattr(resp, 'status_code', 'unknown')}")
+            except Exception:
+                pass
+            try:
+                body = getattr(resp, "text", None) or getattr(resp, "content", None)
+                if body:
+                    detail_parts.append(f"Response body: {body}")
+            except Exception:
+                pass
+        if getattr(e, "__cause__", None) is not None:
+            detail_parts.append(f"Cause: {repr(e.__cause__)}")
+        raise RuntimeError(
+            "Whisper transcription call failed.\n" + "\n".join(detail_parts)
+        ) from e
     finally:
-        os.unlink(tmp_path)
+        if tmp_path:
+            try:
+                os.unlink(tmp_path)
+            except Exception:
+                pass
 
 
 def run_audora_chain(
@@ -646,12 +701,19 @@ if not GTTS_OK:      missing.append("`gTTS`")
 if openai is None:   missing.append("`openai`")
 
 if missing:
-    st.warning(
+    extra = []
+    if not LANGCHAIN_OK and LANGCHAIN_IMPORT_ERROR:
+        extra.append(f"LangChain import error: {LANGCHAIN_IMPORT_ERROR}")
+    if openai is None and OPENAI_IMPORT_ERROR:
+        extra.append(f"openai import error: {OPENAI_IMPORT_ERROR}")
+    warning_text = (
         "**Missing dependencies.** Install them and restart:\n\n"
         "```bash\npip install openai langchain langchain-openai langchain-community "
-        "faiss-cpu PyPDF2 gTTS streamlit\n```",
-        icon="⚠️",
+        "faiss-cpu PyPDF2 gTTS streamlit\n```"
     )
+    if extra:
+        warning_text += "\n\nImport details:\n" + "\n".join(extra)
+    st.warning(warning_text, icon="⚠️")
 
 # ── Upload columns ─────────────────────────────────────────────────────────────
 col_left, col_right = st.columns(2, gap="large")
@@ -737,7 +799,9 @@ if run_button and audio_file and api_key:
             st.stop()
         st.toast("✅ Transcription complete", icon="🎙️")
     except Exception as e:
-        st.error(f"Transcription failed: {e}")
+        st.error(f"Transcription failed ({type(e).__name__}): {e}")
+        with st.expander("Transcription debug details"):
+            st.code(traceback.format_exc())
         st.stop()
 
     # ── STEP 3: LLM reasoning + note generation ─────────────────────────────
