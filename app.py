@@ -1,58 +1,15 @@
-"""
-╔══════════════════════════════════════════════════════════════════════════════╗
-║                            AUDORA MVP                                        ║
-║              Syllabus-Aware AI Lecture Intelligence System                   ║
-╚══════════════════════════════════════════════════════════════════════════════╝
-
-ARCHITECTURE OVERVIEW
-─────────────────────
-1. INGEST
-   • Syllabus PDF  → PyPDF2 text extraction → RecursiveCharacterTextSplitter
-     → OpenAIEmbeddings → FAISS vectorstore (in-memory)
-   • Lecture MP3   → OpenAI Whisper API → raw transcript (timestamped)
-
-2. NOISE GATE
-   • The raw transcript is passed through a semantic filter prompt that
-     identifies and strips non-academic segments (greetings, roll-call,
-     disciplinary remarks, jokes, admin notices) before any further
-     processing.
-
-3. SYLLABUS-AWARE RAG (Retrieval-Augmented Generation)
-   • Each transcript sentence/chunk is embedded and queried against the
-     FAISS syllabus store.  The top-k syllabus chunks become the
-     "grounding context" injected into the LLM prompt, ensuring that
-     generated headers mirror official module names from the syllabus.
-
-4. LLM REASONING  (GPT-4o / Claude 3.5)
-   • System prompt (below) instructs the model to:
-       a) Map content to syllabus modules
-       b) Remove fluff
-       c) Return structured JSON with "notes" and "exam_radar"
-
-5. EXAM RADAR
-   • During LLM processing, urgency signals (mid-term, final, paper,
-     important, remember, exam, quiz, assignment) are flagged and
-     returned in the exam_radar JSON array.
-
-6. OUTPUT
-   • Structured markdown notes rendered in Streamlit
-   • Exam Radar alert cards
-   • gTTS audio synthesis of the notes → st.audio player
-   • Optional translation via LLM before TTS
-"""
-
-import os
 import json
-import tempfile
-import textwrap
+import html
+import os
 import re
+import tempfile
+import time
 import traceback
-from pathlib import Path
 from io import BytesIO
+from pathlib import Path
 
 import streamlit as st
 
-# Load local .env (useful for OPENAI_API_KEY during development).
 try:
     from dotenv import load_dotenv
 
@@ -60,89 +17,316 @@ try:
 except Exception:
     pass
 
-# ── optional imports with graceful error messages ──────────────────────────────
+# Optional imports
+try:
+    from groq import Groq
+    GROQ_OK = True
+    GROQ_ERROR = None
+except ImportError as e:
+    Groq = None
+    GROQ_OK = False
+    GROQ_ERROR = str(e)
+
 try:
     import openai
-    OPENAI_IMPORT_ERROR = None
+
+    OPENAI_OK = True
+    OPENAI_ERROR = None
 except ImportError as e:
     openai = None
-    OPENAI_IMPORT_ERROR = str(e)
+    OPENAI_OK = False
+    OPENAI_ERROR = str(e)
 
 try:
-    from langchain_openai import OpenAIEmbeddings, ChatOpenAI
-    from langchain_community.vectorstores import FAISS
+    from sentence_transformers import SentenceTransformer
+
+    SBERT_OK = True
+    SBERT_ERROR = None
+except ImportError as e:
+    SentenceTransformer = None
+    SBERT_OK = False
+    SBERT_ERROR = str(e)
+
+try:
+    import faiss
+    import numpy as np
+
+    FAISS_OK = True
+    FAISS_ERROR = None
+except ImportError as e:
+    faiss = None
+    np = None
+    FAISS_OK = False
+    FAISS_ERROR = str(e)
+
+try:
+    from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+    from langchain_community.vectorstores import FAISS as LCFAISS
+
     try:
-        # Newer LangChain splits text splitters into a dedicated package.
         from langchain_text_splitters import RecursiveCharacterTextSplitter
     except ImportError:
-        # Older LangChain versions keep splitters under `langchain.text_splitter`.
         from langchain.text_splitter import RecursiveCharacterTextSplitter
+
     try:
-        # Newer LangChain versions expose messages via langchain_core.
-        from langchain_core.messages import SystemMessage, HumanMessage
+        from langchain_core.messages import HumanMessage, SystemMessage
     except ImportError:
-        # Backwards-compatible fallback.
-        from langchain.schema import SystemMessage, HumanMessage
+        from langchain.schema import HumanMessage, SystemMessage
 
     LANGCHAIN_OK = True
-    LANGCHAIN_IMPORT_ERROR = None
+    LANGCHAIN_ERROR = None
 except ImportError as e:
+    ChatOpenAI = None
+    OpenAIEmbeddings = None
+    LCFAISS = None
+    RecursiveCharacterTextSplitter = None
+    HumanMessage = None
+    SystemMessage = None
     LANGCHAIN_OK = False
-    LANGCHAIN_IMPORT_ERROR = str(e)
+    LANGCHAIN_ERROR = str(e)
 
 try:
     import PyPDF2
+
     PYPDF2_OK = True
-except ImportError:
+    PYPDF2_ERROR = None
+except ImportError as e:
+    PyPDF2 = None
     PYPDF2_OK = False
+    PYPDF2_ERROR = str(e)
+
+try:
+    import pypdfium2 as pdfium
+
+    PDFIUM_OK = True
+    PDFIUM_ERROR = None
+except ImportError as e:
+    pdfium = None
+    PDFIUM_OK = False
+    PDFIUM_ERROR = str(e)
+
+try:
+    from PIL import Image
+
+    PIL_OK = True
+    PIL_ERROR = None
+except ImportError as e:
+    Image = None
+    PIL_OK = False
+    PIL_ERROR = str(e)
+
+try:
+    import pytesseract
+
+    PYTESSERACT_OK = True
+    PYTESSERACT_ERROR = None
+except ImportError as e:
+    pytesseract = None
+    PYTESSERACT_OK = False
+    PYTESSERACT_ERROR = str(e)
+
+if PYTESSERACT_OK:
+    try:
+        pytesseract.get_tesseract_version()
+        TESSERACT_RUNTIME_OK = True
+        TESSERACT_RUNTIME_ERROR = None
+    except Exception as e:
+        TESSERACT_RUNTIME_OK = False
+        TESSERACT_RUNTIME_ERROR = str(e)
+else:
+    TESSERACT_RUNTIME_OK = False
+    TESSERACT_RUNTIME_ERROR = "pytesseract is not installed"
 
 try:
     from gtts import gTTS
-    GTTS_OK = True
-except ImportError:
-    GTTS_OK = False
 
-# ══════════════════════════════════════════════════════════════════════════════
-# PAGE CONFIG & STYLING
-# ══════════════════════════════════════════════════════════════════════════════
+    GTTS_OK = True
+    GTTS_ERROR = None
+except ImportError as e:
+    gTTS = None
+    GTTS_OK = False
+    GTTS_ERROR = str(e)
+
+try:
+    from pydub import AudioSegment
+
+    PYDUB_OK = True
+    PYDUB_ERROR = None
+except ImportError as e:
+    AudioSegment = None
+    PYDUB_OK = False
+    PYDUB_ERROR = str(e)
+
+
+def _ocr_stack_ready() -> bool:
+    return PDFIUM_OK and PIL_OK and PYTESSERACT_OK and TESSERACT_RUNTIME_OK
+
+
+def _ocr_install_message() -> str:
+    return (
+        f"OCR fallback is unavailable because one or more OCR dependencies are missing. "
+        f"Install them with: {OCR_DEPENDENCY_HINT}. "
+        f"On Windows, also install the Tesseract runtime, for example: winget install UB-Mannheim.TesseractOCR."
+    )
+
+
+def _text_signal_score(text: str) -> float:
+    cleaned = re.sub(r"\s+", " ", text or "").strip()
+    if not cleaned:
+        return 0.0
+    words = re.findall(r"[A-Za-z0-9][A-Za-z0-9+/_-]{1,}", cleaned)
+    visible_chars = sum(1 for char in cleaned if not char.isspace())
+    alpha_chars = sum(1 for char in cleaned if char.isalpha())
+    alpha_ratio = alpha_chars / max(visible_chars, 1)
+    unique_ratio = len({word.lower() for word in words}) / max(len(words), 1)
+    score = 0.0
+    score += min(len(cleaned) / 400.0, 1.0) * 0.35
+    score += min(len(words) / 40.0, 1.0) * 0.35
+    score += alpha_ratio * 0.2
+    score += unique_ratio * 0.1
+    return min(score, 1.0)
+
+
+def maybe_needs_ocr(extracted_text: str) -> bool:
+    cleaned = re.sub(r"\s+", " ", extracted_text or "").strip()
+    if not cleaned:
+        return True
+    if _text_signal_score(cleaned) < 0.45:
+        return True
+    if re.search(r"\b(cid:\d+|xref|obj|endobj)\b", cleaned, re.IGNORECASE):
+        return True
+    if re.search(r"[\uFFFD\u25A1]{2,}", cleaned):
+        return True
+    return False
+
+
+def _extract_pdf_text_layer1(pdf_bytes: bytes) -> str:
+    if not PYPDF2_OK:
+        return ""
+    try:
+        reader = PyPDF2.PdfReader(BytesIO(pdf_bytes))
+        pages = []
+        for page in reader.pages:
+            page_text = page.extract_text() or ""
+            if page_text.strip():
+                pages.append(page_text.strip())
+        return "\n\n".join(pages).strip()
+    except Exception as e:
+        st.warning(f"PDF extraction issue: {e}")
+        return ""
+
+
+def ocr_pdf_pages_to_text(pdf_bytes: bytes) -> str:
+    if not _ocr_stack_ready():
+        st.warning(_ocr_install_message())
+        if not PYTESSERACT_OK:
+            st.caption(f"Missing pytesseract: {PYTESSERACT_ERROR}")
+        elif not PDFIUM_OK:
+            st.caption(f"Missing pypdfium2: {PDFIUM_ERROR}")
+        elif not PIL_OK:
+            st.caption(f"Missing Pillow: {PIL_ERROR}")
+        elif not TESSERACT_RUNTIME_OK:
+            st.caption(f"Tesseract runtime not available: {TESSERACT_RUNTIME_ERROR}")
+        return ""
+
+    tmp_path = None
+    page_texts: list[str] = []
+    failed_pages: list[int] = []
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+            tmp.write(pdf_bytes)
+            tmp_path = tmp.name
+
+        document = pdfium.PdfDocument(tmp_path)
+        for page_number, page in enumerate(document, start=1):
+            try:
+                bitmap = page.render(scale=2.0)
+                image = bitmap.to_pil()
+                if image.mode != "RGB":
+                    image = image.convert("RGB")
+                text = pytesseract.image_to_string(image).strip()
+                if text:
+                    page_texts.append(text)
+            except Exception:
+                failed_pages.append(page_number)
+
+        if failed_pages:
+            sample_pages = ", ".join(str(page) for page in failed_pages[:5])
+            suffix = "..." if len(failed_pages) > 5 else ""
+            st.warning(f"OCR skipped {len(failed_pages)} page(s): {sample_pages}{suffix}")
+
+        return "\n\n".join(page_texts).strip()
+    except Exception as e:
+        st.warning(f"OCR fallback failed: {e}")
+        return ""
+    finally:
+        if tmp_path:
+            try:
+                os.unlink(tmp_path)
+            except Exception:
+                pass
+
+
+def extract_pdf_text_with_ocr(pdf_bytes: bytes) -> str:
+    layer1_text = _extract_pdf_text_layer1(pdf_bytes)
+    if layer1_text and not maybe_needs_ocr(layer1_text):
+        return layer1_text
+
+    ocr_text = ocr_pdf_pages_to_text(pdf_bytes)
+    if ocr_text and _text_signal_score(ocr_text) > _text_signal_score(layer1_text):
+        st.toast("OCR fallback used for scanned syllabus PDF", icon="🔎")
+        return ocr_text
+
+    if layer1_text:
+        if maybe_needs_ocr(layer1_text) and not ocr_text:
+            st.warning("Syllabus PDF looks scanned, but OCR could not run. Continuing with the best available extracted text.")
+        return layer1_text
+
+    if ocr_text:
+        st.toast("OCR fallback used for scanned syllabus PDF", icon="🔎")
+        return ocr_text
+
+    st.warning("Could not extract any readable text from the syllabus PDF.")
+    return ""
+
+
+def extract_pdf_text(pdf_bytes: bytes) -> str:
+    return extract_pdf_text_with_ocr(pdf_bytes)
+
 
 st.set_page_config(
-    page_title="Audora — Syllabus-Aware Lecture Intelligence",
+    page_title="Audora - Automated Lecture Synthesis",
     page_icon="🎓",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
-# High-contrast, accessible dark theme with strong typography
-st.markdown("""
+st.markdown(
+    """
 <style>
-  /* ── Imports ── */
   @import url('https://fonts.googleapis.com/css2?family=Syne:wght@400;700;800&family=DM+Mono:wght@400;500&family=Inter:wght@300;400;500&display=swap');
 
-  /* ── Root palette ── */
   :root {
-    --bg:        #0d0f14;
-    --surface:   #161a23;
-    --border:    #252b3a;
-    --accent:    #4fffb0;   /* electric mint — high contrast on dark */
-    --accent2:   #ff6b6b;   /* exam radar red */
-    --accent3:   #ffd166;   /* warning amber */
-    --text:      #e8eaf2;
-    --muted:     #7b82a0;
-    --radius:    12px;
+    --bg:      #0d0f14;
+    --surface: #161a23;
+    --border:  #252b3a;
+    --accent:  #4fffb0;
+    --accent2: #ff6b6b;
+    --accent3: #ffd166;
+    --info:    #00c4ff;
+    --text:    #e8eaf2;
+    --muted:   #7b82a0;
+    --radius:  12px;
   }
 
-  /* ── Global reset ── */
   html, body, [class*="css"] {
     background-color: var(--bg) !important;
     color: var(--text) !important;
     font-family: 'Inter', sans-serif;
   }
 
-  /* ── App container ── */
   .main .block-container { padding: 2rem 3rem; max-width: 1280px; }
 
-  /* ── Hero wordmark ── */
   .audora-wordmark {
     font-family: 'Syne', sans-serif;
     font-weight: 800;
@@ -153,97 +337,110 @@ st.markdown("""
     -webkit-text-fill-color: transparent;
     background-clip: text;
     line-height: 1;
-    margin-bottom: 0;
-  }
-  .audora-tagline {
-    font-family: 'DM Mono', monospace;
-    font-size: 0.85rem;
-    color: var(--muted);
-    letter-spacing: 2px;
-    text-transform: uppercase;
-    margin-top: 0.25rem;
   }
 
-  /* ── Cards ── */
+    .audora-wordmark-sidebar {
+        font-family: 'Syne', sans-serif;
+        font-weight: 800;
+        font-size: 1.9rem;
+        letter-spacing: -1px;
+        background: linear-gradient(135deg, var(--accent) 0%, #00c4ff 100%);
+        -webkit-background-clip: text;
+        -webkit-text-fill-color: transparent;
+        background-clip: text;
+        line-height: 1;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        max-width: 100%;
+    }
+
+  .audora-tagline {
+    font-family: 'DM Mono', monospace;
+        font-size: 0.8rem;
+    color: var(--muted);
+        letter-spacing: 0.5px;
+        text-transform: none;
+    margin-top: 0.3rem;
+  }
+
+  .pill {
+    display: inline-block;
+    border-radius: 20px;
+    padding: 2px 12px;
+    font-family: 'DM Mono', monospace;
+    font-size: 0.68rem;
+    letter-spacing: 2px;
+    text-transform: uppercase;
+    margin-left: 0.5rem;
+    vertical-align: middle;
+  }
+  .pill-green { background: rgba(79,255,176,0.12); border: 1px solid var(--accent); color: var(--accent); }
+  .pill-blue  { background: rgba(0,196,255,0.12); border: 1px solid var(--info); color: var(--info); }
+  .pill-orange { background: rgba(255,209,102,0.12); border: 1px solid var(--accent3); color: var(--accent3); }
+
   .card {
     background: var(--surface);
     border: 1px solid var(--border);
     border-radius: var(--radius);
-    padding: 1.5rem;
-    margin-bottom: 1.25rem;
+    padding: 1.25rem 1.5rem;
+    margin-bottom: 1.1rem;
   }
-  .card-accent { border-left: 4px solid var(--accent); }
-  .card-danger  { border-left: 4px solid var(--accent2); }
-  .card-warning { border-left: 4px solid var(--accent3); }
+  .card-green  { border-left: 4px solid var(--accent); }
+  .card-red    { border-left: 4px solid var(--accent2); }
 
-  /* ── Section headers ── */
   .section-label {
     font-family: 'DM Mono', monospace;
-    font-size: 0.7rem;
+    font-size: 0.68rem;
     letter-spacing: 3px;
     text-transform: uppercase;
     color: var(--accent);
-    margin-bottom: 0.75rem;
+    margin-bottom: 0.7rem;
   }
 
-  /* ── Exam Radar badge ── */
-  .radar-badge {
+  .rbadge {
     display: inline-block;
-    background: rgba(255,107,107,0.15);
-    border: 1px solid var(--accent2);
-    color: var(--accent2);
     border-radius: 6px;
     padding: 2px 10px;
-    font-size: 0.75rem;
+    font-size: 0.72rem;
     font-family: 'DM Mono', monospace;
     font-weight: 500;
     letter-spacing: 1px;
     text-transform: uppercase;
-    margin-right: 0.5rem;
-    margin-bottom: 0.35rem;
+    margin-right: 0.4rem;
+    margin-bottom: 0.3rem;
   }
-  .radar-high  { border-color: #ff4444; color: #ff4444; background: rgba(255,68,68,0.12); }
-  .radar-med   { border-color: var(--accent3); color: var(--accent3); background: rgba(255,209,102,0.10); }
+  .rbadge-high { border: 1px solid #ff4444; color: #ff4444; background: rgba(255,68,68,0.12); }
+  .rbadge-med  { border: 1px solid var(--accent3); color: var(--accent3); background: rgba(255,209,102,0.10); }
+  .rbadge-mod  { border: 1px solid var(--muted); color: var(--muted); background: transparent; }
+    .confidence-row {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 0.35rem;
+        margin: 0.2rem 0 0.9rem;
+    }
+    .confidence-high { border: 1px solid var(--accent); color: var(--accent); background: rgba(79,255,176,0.10); }
+    .confidence-med { border: 1px solid var(--accent3); color: var(--accent3); background: rgba(255,209,102,0.10); }
+    .confidence-low { border: 1px solid var(--accent2); color: var(--accent2); background: rgba(255,107,107,0.10); }
+    .confidence-reason {
+        color: var(--muted);
+        font-size: 0.8rem;
+        line-height: 1.6;
+        margin: 0.25rem 0 0;
+    }
 
-  /* ── Note content ── */
-  .notes-body {
-    font-family: 'Inter', sans-serif;
-    font-size: 1rem;
-    line-height: 1.8;
-    color: var(--text);
-  }
+  .notes-body { font-size: 1rem; line-height: 1.85; }
   .notes-body h2 {
     font-family: 'Syne', sans-serif;
-    font-size: 1.35rem;
+    font-size: 1.3rem;
     font-weight: 700;
     color: var(--accent);
-    margin-top: 1.75rem;
+    margin-top: 1.5rem;
     margin-bottom: 0.5rem;
     border-bottom: 1px solid var(--border);
-    padding-bottom: 0.4rem;
-  }
-  .notes-body h3 {
-    font-family: 'Syne', sans-serif;
-    font-size: 1.05rem;
-    color: #7ee8c8;
-    margin-top: 1.25rem;
-  }
-  .notes-body ul { padding-left: 1.4rem; }
-  .notes-body li { margin-bottom: 0.35rem; }
-  .notes-body strong { color: #ffd166; }
-
-  /* ── Upload zones ── */
-  [data-testid="stFileUploader"] {
-    background: var(--surface) !important;
-    border: 2px dashed var(--border) !important;
-    border-radius: var(--radius) !important;
-    padding: 1rem !important;
-  }
-  [data-testid="stFileUploader"]:hover {
-    border-color: var(--accent) !important;
+    padding-bottom: 0.35rem;
   }
 
-  /* ── Buttons ── */
   .stButton > button {
     background: var(--accent) !important;
     color: #0d0f14 !important;
@@ -252,239 +449,480 @@ st.markdown("""
     font-size: 1rem !important;
     border: none !important;
     border-radius: 8px !important;
-    padding: 0.6rem 2rem !important;
+    padding: 0.65rem 2rem !important;
     width: 100%;
-    letter-spacing: 0.5px;
-    transition: opacity 0.2s;
   }
-  .stButton > button:hover { opacity: 0.85 !important; }
 
-  /* ── Sidebar ── */
   [data-testid="stSidebar"] {
     background: var(--surface) !important;
     border-right: 1px solid var(--border) !important;
   }
 
-  /* ── Selectbox / inputs ── */
-  .stSelectbox > div > div, .stTextInput > div > div > input {
+  .stTextInput > div > div > input, .stSelectbox > div > div {
     background: var(--bg) !important;
     color: var(--text) !important;
     border-color: var(--border) !important;
     border-radius: 8px !important;
   }
 
-  /* ── Progress / spinner ── */
   .stProgress > div > div { background: var(--accent) !important; }
-  .stSpinner > div { border-top-color: var(--accent) !important; }
-
-  /* ── Divider ── */
-  hr { border-color: var(--border) !important; }
-
-  /* ── Accessibility: focus ring ── */
-  *:focus-visible { outline: 2px solid var(--accent) !important; outline-offset: 2px; }
 </style>
-""", unsafe_allow_html=True)
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# THE "BRAIN" — SYSTEM PROMPT
-# ══════════════════════════════════════════════════════════════════════════════
+""",
+    unsafe_allow_html=True,
+)
 
 AUDORA_SYSTEM_PROMPT = """
-You are Audora, an elite academic note-taking AI. Your role is to transform a
-raw lecture transcript into structured, high-signal study notes — guided
-exclusively by the official course syllabus provided as context.
+You are Audora, an elite academic note-taking AI. Transform a raw lecture
+transcript into structured, high-signal study notes guided by the course syllabus.
 
-═══════════════════════════════════════════════════════
 CORE DIRECTIVES
-═══════════════════════════════════════════════════════
+1. NOISE GATE — discard greetings, admin talk, attendance, discipline remarks,
+   jokes, tangents, and filler words.
+2. SYLLABUS MAPPING — use official module/topic headers from syllabus context.
+3. EXAM RADAR — flag assessment cues like mid-term, final, quiz, assignment,
+   important, remember this, or likely exam hints.
+4. MULTILINGUAL — if target language is provided, output in that language while
+   keeping technical terms in English with translations in parentheses.
 
-1. NOISE GATE — DISCARD completely (do not mention, summarise, or reference):
-   • Greetings, farewells, small-talk ("good morning", "see you next week")
-   • Administrative announcements (room changes, registration deadlines)
-   • Attendance & roll-call ("anyone absent?", "sign the sheet")
-   • Disciplinary remarks ("put your phone away", "no talking")
-   • Jokes, tangents, and personal anecdotes unrelated to course content
-   • Repetition/filler ("um", "uh", "you know", "basically")
-
-2. SYLLABUS MAPPING — Structure notes under official module/topic headers
-   drawn directly from the SYLLABUS CONTEXT provided. If a lecture segment
-   does not map to any syllabus topic, use the closest match and note it with
-   "(Extended Coverage)". Never invent module names.
-
-3. EXAM RADAR — Detect urgency signals in the transcript. Trigger phrases
-   include (but are not limited to): "mid-term", "final exam", "quiz",
-   "assignment", "paper", "project", "will be tested", "remember this",
-   "important", "key concept", "this comes up", "you need to know",
-   "exam question", "marks", "graded". For each detected signal, record the
-   hint verbatim (cleaned of filler) plus its urgency level (HIGH or MEDIUM).
-
-4. MULTILINGUAL OUTPUT — If a target language is specified, write ALL notes
-   and summaries in that language. Retain original technical terminology in
-   English with a parenthetical translation.
-
-═══════════════════════════════════════════════════════
-OUTPUT FORMAT — Return ONLY valid JSON, no markdown fences:
-═══════════════════════════════════════════════════════
-
+Return ONLY JSON with keys:
 {
-  "title": "<Lecture title inferred from content>",
-  "summary": "<2-3 sentence executive summary of the lecture>",
-  "notes": [
-    {
-      "module": "<Exact syllabus module name>",
-      "content": "<Well-structured markdown: use ## headings, bullet points, bold for key terms, and code blocks for formulas/algorithms>"
-    }
-  ],
-  "exam_radar": [
-    {
-      "hint": "<Cleaned verbatim exam hint from lecturer>",
-      "module": "<Relevant module name>",
-      "urgency": "HIGH | MEDIUM",
-      "reason": "<Why this is flagged — what was said>"
-    }
-  ],
-  "filtered_count": <integer — number of noise segments removed>,
-  "language": "<ISO 639-1 code of output language>"
+  "title": "...",
+  "summary": "...",
+    "notes": [{"module": "...", "content": "...", "source_refs": []}],
+  "exam_radar": [{"hint": "...", "module": "...", "urgency": "HIGH|MEDIUM", "reason": "..."}],
+  "filtered_count": 0,
+  "language": "en"
 }
 """
 
-# ══════════════════════════════════════════════════════════════════════════════
-# HELPER FUNCTIONS
-# ══════════════════════════════════════════════════════════════════════════════
+LANGUAGES = {
+    "English": ("en", "en"),
+    "Spanish": ("es", "es"),
+    "French": ("fr", "fr"),
+    "German": ("de", "de"),
+    "Arabic": ("ar", "ar"),
+    "Urdu": ("ur", "ur"),
+    "Hindi": ("hi", "hi"),
+    "Portuguese": ("pt", "pt"),
+    "Japanese": ("ja", "ja"),
+    "Mandarin": ("zh-CN", "zh"),
+}
 
-def get_api_key() -> str:
-    """Retrieve OpenAI key from env or Streamlit secrets."""
-    key = os.getenv("OPENAI_API_KEY", "").strip()
-    if not key:
-        try:
-            key = (st.secrets.get("OPENAI_API_KEY", "") or "").strip()
-        except Exception:
-            pass
-    return key
+SUPPORTED_AUDIO_EXTENSIONS = {".mp3", ".mp4", ".m4a", ".wav", ".ogg", ".flac", ".webm", ".mpeg", ".mpga"}
+
+CONTENT_TYPES = {
+    ".mp3": "audio/mpeg",
+    ".mp4": "audio/mp4",
+    ".m4a": "audio/mp4",
+    ".wav": "audio/wav",
+    ".ogg": "audio/ogg",
+    ".flac": "audio/flac",
+    ".webm": "audio/webm",
+    ".mpeg": "audio/mpeg",
+    ".mpga": "audio/mpeg",
+}
+
+OCR_DEPENDENCY_HINT = "pip install pypdfium2 pytesseract Pillow"
+
+GENERIC_NOTE_PHRASES = [
+    "general overview",
+    "key points",
+    "important points",
+    "this section",
+    "summary of lecture",
+    "general notes",
+    "basic introduction",
+    "review the topic",
+]
+
+STOPWORDS = {
+    "a",
+    "about",
+    "after",
+    "all",
+    "also",
+    "and",
+    "are",
+    "as",
+    "at",
+    "be",
+    "because",
+    "but",
+    "by",
+    "can",
+    "class",
+    "course",
+    "for",
+    "from",
+    "get",
+    "has",
+    "have",
+    "he",
+    "her",
+    "his",
+    "how",
+    "if",
+    "in",
+    "into",
+    "is",
+    "it",
+    "lecture",
+    "module",
+    "notes",
+    "of",
+    "on",
+    "or",
+    "our",
+    "out",
+    "page",
+    "pdf",
+    "section",
+    "that",
+    "the",
+    "their",
+    "this",
+    "to",
+    "topic",
+    "up",
+    "was",
+    "we",
+    "were",
+    "what",
+    "when",
+    "which",
+    "with",
+    "you",
+    "your",
+}
+
+
+def get_env_key(name: str) -> str:
+    value = os.getenv(name, "").strip()
+    if value:
+        return value
+    try:
+        return (st.secrets.get(name, "") or "").strip()
+    except Exception:
+        return ""
 
 
 def extract_pdf_text(pdf_bytes: bytes) -> str:
-    """
-    Extract plain text from a PDF file.
-    Falls back to a page-by-page extraction strategy.
-    """
     if not PYPDF2_OK:
-        st.error("PyPDF2 not installed. Run: pip install PyPDF2")
         return ""
-    reader = PyPDF2.PdfReader(BytesIO(pdf_bytes))
-    pages = []
-    for page in reader.pages:
-        text = page.extract_text()
-        if text:
-            pages.append(text.strip())
-    return "\n\n".join(pages)
+    try:
+        reader = PyPDF2.PdfReader(BytesIO(pdf_bytes))
+        pages = [p.extract_text() for p in reader.pages if p.extract_text()]
+        return "\n\n".join(pages).strip()
+    except Exception as e:
+        st.warning(f"PDF extraction issue: {e}")
+        return ""
 
 
-def build_syllabus_vectorstore(syllabus_text: str, api_key: str):
-    """
-    SYLLABUS VECTORIZATION PIPELINE
-    ────────────────────────────────
-    1. Split the syllabus into overlapping chunks so that topic boundaries
-       are captured even when a topic spans paragraph breaks.
-    2. Embed each chunk with OpenAI's text-embedding model.
-    3. Store in FAISS — a fast in-memory approximate-nearest-neighbor index.
+@st.cache_resource(show_spinner="Loading local embedding model (first run may take a minute)...")
+def load_embedding_model():
+    if not SBERT_OK:
+        return None
+    return SentenceTransformer("all-MiniLM-L6-v2")
 
-    This store acts as the "Ground Truth" during LLM prompting:
-    we retrieve the top-k most relevant syllabus chunks for each lecture
-    segment, injecting them as grounding context so the LLM aligns its
-    headers with official module names rather than hallucinating new ones.
-    """
+
+class SyllabusVectorStore:
+    def __init__(self, chunks: list[str], model):
+        self.chunks = chunks
+        embeddings = model.encode(
+            chunks,
+            batch_size=32,
+            show_progress_bar=False,
+            convert_to_numpy=True,
+        ).astype("float32")
+        faiss.normalize_L2(embeddings)
+        self.index = faiss.IndexFlatIP(embeddings.shape[1])
+        self.index.add(embeddings)
+        self.model = model
+
+    def search(self, query: str, k: int = 8) -> list[str]:
+        k = min(k, len(self.chunks))
+        query_vec = self.model.encode([query], show_progress_bar=False, convert_to_numpy=True).astype("float32")
+        faiss.normalize_L2(query_vec)
+        _, indices = self.index.search(query_vec, k)
+        return [self.chunks[i] for i in indices[0] if 0 <= i < len(self.chunks)]
+
+
+def chunk_text(text: str, chunk_size: int = 500, overlap: int = 80) -> list[str]:
+    if not text.strip():
+        return []
+    for sep in ["\n\n", "\n", ". ", " "]:
+        if sep not in text:
+            continue
+        raw = text.split(sep)
+        chunks = []
+        current = ""
+        for part in raw:
+            candidate = f"{current}{sep}{part}" if current else part
+            if len(candidate) <= chunk_size:
+                current = candidate
+            else:
+                if current.strip():
+                    chunks.append(current.strip())
+                current = part
+        if current.strip():
+            chunks.append(current.strip())
+
+        overlapped = []
+        for i, chunk in enumerate(chunks):
+            if i == 0:
+                overlapped.append(chunk)
+            else:
+                tail = chunks[i - 1][-overlap:]
+                overlapped.append((tail + " " + chunk).strip())
+        return [c for c in overlapped if c.strip()]
+
+    step = max(1, chunk_size - overlap)
+    return [text[i : i + chunk_size] for i in range(0, len(text), step)]
+
+
+def build_groq_vector_store(syllabus_text: str):
+    if not (SBERT_OK and FAISS_OK):
+        return None
+    model = load_embedding_model()
+    if model is None:
+        return None
+    chunks = chunk_text(syllabus_text)
+    if not chunks:
+        return None
+    return SyllabusVectorStore(chunks, model)
+
+
+def build_openai_vector_store(syllabus_text: str, api_key: str):
     if not LANGCHAIN_OK:
         return None
-
     splitter = RecursiveCharacterTextSplitter(
-        chunk_size=600,       # ~150 words — enough for one syllabus topic
-        chunk_overlap=100,    # overlap preserves topic name at chunk edges
+        chunk_size=600,
+        chunk_overlap=100,
         separators=["\n\n", "\n", ". ", " "],
     )
     chunks = splitter.split_text(syllabus_text)
-
-    embeddings = OpenAIEmbeddings(
-        model="text-embedding-3-small",
-        openai_api_key=api_key,
-    )
-    vectorstore = FAISS.from_texts(chunks, embeddings)
-    return vectorstore
+    embeddings = OpenAIEmbeddings(model="text-embedding-3-small", openai_api_key=api_key)
+    return LCFAISS.from_texts(chunks, embeddings)
 
 
-def retrieve_syllabus_context(vectorstore, query: str, k: int = 5) -> str:
-    """
-    SYLLABUS MATCHING LOGIC
-    ────────────────────────
-    Given a transcript chunk (the query), find the top-k syllabus passages
-    that are semantically closest.  These passages are injected into the
-    LLM prompt as the authoritative source of module names.
-
-    Why top-k=5?  A lecture segment can legitimately span multiple syllabus
-    topics (e.g., a transition lecture), so we allow up to 5 anchors.
-    """
-    if vectorstore is None:
+def get_syllabus_context(vector_store, query: str, provider: str) -> str:
+    if vector_store is None:
         return ""
-    docs = vectorstore.similarity_search(query, k=k)
+    if provider == "groq":
+        return "\n---\n".join(vector_store.search(query, k=8))
+    docs = vector_store.similarity_search(query, k=8)
     return "\n---\n".join([d.page_content for d in docs])
 
 
-def transcribe_audio(audio_bytes: bytes, api_key: str, filename: str = "lecture.mp3") -> str:
-    """
-    SPEECH-TO-TEXT via OpenAI Whisper API
-    ──────────────────────────────────────
-    Whisper handles accents, technical jargon, and mixed-language audio well.
-    We write to a temp file because the API requires a file-like object with
-    a known extension.
-    Returns the full raw transcript as a single string.
-    """
-    if openai is None:
-        st.error("openai package not installed. Run: pip install openai")
-        return ""
-
-    api_key = (api_key or "").strip()
-    if not api_key:
+def _validate_audio_extension(filename: str) -> str:
+    suffix = Path(filename).suffix.lower() or ".mp3"
+    if suffix not in SUPPORTED_AUDIO_EXTENSIONS:
         raise ValueError(
-            "OpenAI API key is empty. Set `OPENAI_API_KEY` or enter your key in the sidebar."
+            f"Unsupported audio format '{suffix}'. Supported formats: {', '.join(sorted(SUPPORTED_AUDIO_EXTENSIONS))}"
+        )
+    return suffix
+
+
+def _cleanup_temp_paths(paths: list[str]):
+    for path in paths:
+        try:
+            if path and os.path.exists(path):
+                os.unlink(path)
+        except Exception:
+            pass
+
+
+def _is_non_retryable_transcription_error(exc: Exception) -> bool:
+    msg = str(exc).lower()
+    hard_fail_markers = [
+        "invalid api key",
+        "incorrect api key",
+        "authentication",
+        "unauthorized",
+        "permission",
+        "unsupported",
+        "invalid file format",
+        "model_not_found",
+    ]
+    return any(marker in msg for marker in hard_fail_markers)
+
+
+def _run_with_retries(fn, max_retries: int = 4, base_delay: float = 1.5, max_delay: float = 12.0):
+    for attempt in range(1, max_retries + 1):
+        try:
+            return fn()
+        except Exception as exc:
+            if _is_non_retryable_transcription_error(exc) or attempt >= max_retries:
+                raise
+            delay = min(max_delay, base_delay * (2 ** (attempt - 1)))
+            time.sleep(delay)
+
+
+def chunk_audio(audio_bytes: bytes, filename: str, target_chunk_mb: float = 20.0) -> tuple[list[str], str]:
+    """Split large audio into safe temporary chunks and return chunk file paths + suffix."""
+    if not audio_bytes:
+        raise ValueError("Uploaded lecture file is empty.")
+    if not PYDUB_OK:
+        raise RuntimeError(
+            "Large file chunking requires pydub. Install with: pip install pydub. "
+            "Also ensure ffmpeg is installed and available on PATH."
         )
 
-    client = openai.OpenAI(api_key=api_key)
+    suffix = _validate_audio_extension(filename)
+    target_bytes = int(max(18.0, min(20.0, target_chunk_mb)) * 1024 * 1024)
 
-    suffix = Path(filename).suffix or ".mp3"
+    input_path = None
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as src:
+            src.write(audio_bytes)
+            input_path = src.name
+
+        audio = AudioSegment.from_file(input_path)
+        duration_ms = len(audio)
+        if duration_ms <= 0:
+            raise ValueError("Could not decode audio stream; duration is zero.")
+
+        bytes_per_ms = max(1.0, len(audio_bytes) / duration_ms)
+        chunk_duration_ms = int(target_bytes / bytes_per_ms)
+        chunk_duration_ms = max(30_000, chunk_duration_ms)
+
+        chunk_paths: list[str] = []
+        start_ms = 0
+        chunk_idx = 1
+        while start_ms < duration_ms:
+            end_ms = min(start_ms + chunk_duration_ms, duration_ms)
+            segment = audio[start_ms:end_ms]
+            if len(segment) <= 0:
+                break
+            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as dst:
+                segment.export(dst.name, format=suffix.lstrip("."))
+                chunk_paths.append(dst.name)
+            start_ms = end_ms
+            chunk_idx += 1
+
+        if not chunk_paths:
+            raise ValueError("Chunking produced no output segments.")
+        return chunk_paths, suffix
+    except Exception:
+        raise
+    finally:
+        if input_path:
+            _cleanup_temp_paths([input_path])
+
+
+def _transcribe_file_with_groq(file_path: str, filename: str, groq_key: str) -> str:
+    suffix = _validate_audio_extension(filename)
+    if not GROQ_OK:
+        raise RuntimeError("groq package not installed. Run: pip install groq")
+    if not groq_key:
+        raise ValueError("Groq API key missing.")
+
+    client = Groq(api_key=groq_key)
+    with open(file_path, "rb") as audio_file:
+        audio_bytes = audio_file.read()
+    result = client.audio.transcriptions.create(
+        model="whisper-large-v3-turbo",
+        file=(filename, audio_bytes, CONTENT_TYPES.get(suffix, "audio/mpeg")),
+        response_format="text",
+    )
+    return str(result).strip()
+
+
+def _transcribe_file_with_openai(file_path: str, api_key: str) -> str:
+    if not OPENAI_OK:
+        raise RuntimeError("openai package not installed. Run: pip install openai")
+    if not api_key:
+        raise ValueError("OpenAI API key missing.")
+
+    client = openai.OpenAI(api_key=api_key)
+    with open(file_path, "rb") as audio_file:
+        response = client.audio.transcriptions.create(
+            model="whisper-1",
+            file=audio_file,
+            response_format="text",
+        )
+    return str(response).strip()
+
+
+def transcribe_audio_orchestrator(audio_bytes, filename, provider, api_key, progress_callback=None):
+    """Transcribe small files directly and large files via chunking with ordered stitching."""
+    suffix = _validate_audio_extension(filename)
+    size_mb = len(audio_bytes) / (1024 * 1024)
+
+    if size_mb <= 25:
+        if provider == "groq":
+            return transcribe_with_groq(audio_bytes, filename, api_key)
+        if provider == "openai":
+            return transcribe_with_openai(audio_bytes, filename, api_key)
+        raise ValueError(f"Unsupported provider: {provider}")
+
+    if progress_callback:
+        progress_callback("preparing")
+
+    chunk_paths: list[str] = []
+    try:
+        chunk_paths, _ = chunk_audio(audio_bytes, filename, target_chunk_mb=20.0)
+        total_chunks = len(chunk_paths)
+
+        chunk_transcripts: list[str] = []
+        for idx, chunk_path in enumerate(chunk_paths, start=1):
+            if progress_callback:
+                progress_callback("chunk", idx, total_chunks)
+
+            chunk_filename = f"{Path(filename).stem}_chunk_{idx}{suffix}"
+            if provider == "groq":
+                text = _run_with_retries(lambda: _transcribe_file_with_groq(chunk_path, chunk_filename, api_key))
+            elif provider == "openai":
+                text = _run_with_retries(lambda: _transcribe_file_with_openai(chunk_path, api_key))
+            else:
+                raise ValueError(f"Unsupported provider: {provider}")
+
+            cleaned = text.strip()
+            if cleaned:
+                chunk_transcripts.append(f"--- Chunk {idx} ---\n{cleaned}")
+
+        if progress_callback:
+            progress_callback("merging")
+
+        merged = "\n\n".join(chunk_transcripts).strip()
+        if not merged:
+            raise RuntimeError("Transcription completed but all chunk outputs were empty.")
+        return merged
+    finally:
+        _cleanup_temp_paths(chunk_paths)
+
+
+def transcribe_with_groq(audio_bytes: bytes, filename: str, groq_key: str) -> str:
+    if not GROQ_OK:
+        raise RuntimeError("groq package not installed. Run: pip install groq")
+    if not groq_key:
+        raise ValueError("Groq API key missing.")
+    suffix = _validate_audio_extension(filename)
+
+    client = Groq(api_key=groq_key)
+    result = client.audio.transcriptions.create(
+        model="whisper-large-v3-turbo",
+        file=(filename, audio_bytes, CONTENT_TYPES.get(suffix, "audio/mpeg")),
+        response_format="text",
+    )
+    return str(result).strip()
+
+
+def transcribe_with_openai(audio_bytes: bytes, filename: str, api_key: str) -> str:
+    if not OPENAI_OK:
+        raise RuntimeError("openai package not installed. Run: pip install openai")
+    if not api_key:
+        raise ValueError("OpenAI API key missing.")
+
+    suffix = _validate_audio_extension(filename)
     tmp_path = None
+
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
         tmp.write(audio_bytes)
         tmp_path = tmp.name
+
     try:
-        with open(tmp_path, "rb") as audio_file:
-            response = client.audio.transcriptions.create(
-                model="whisper-1",
-                file=audio_file,
-                response_format="text",  # plain text — fastest for MVP
-            )
-        return response
-    except Exception as e:
-        # Surface the underlying OpenAI exception (network vs auth vs status).
-        detail_parts = [f"{type(e).__name__}: {e}"]
-        detail_parts.append(f"API key length: {len(api_key)}")
-        resp = getattr(e, "response", None)
-        if resp is not None:
-            try:
-                detail_parts.append(f"Response status: {getattr(resp, 'status_code', 'unknown')}")
-            except Exception:
-                pass
-            try:
-                body = getattr(resp, "text", None) or getattr(resp, "content", None)
-                if body:
-                    detail_parts.append(f"Response body: {body}")
-            except Exception:
-                pass
-        if getattr(e, "__cause__", None) is not None:
-            detail_parts.append(f"Cause: {repr(e.__cause__)}")
-        raise RuntimeError(
-            "Whisper transcription call failed.\n" + "\n".join(detail_parts)
-        ) from e
+        return _transcribe_file_with_openai(tmp_path, api_key)
     finally:
         if tmp_path:
             try:
@@ -493,508 +931,705 @@ def transcribe_audio(audio_bytes: bytes, api_key: str, filename: str = "lecture.
                 pass
 
 
-def run_audora_chain(
-    transcript: str,
-    vectorstore,
-    api_key: str,
-    target_language: str = "English",
-) -> dict:
-    """
-    CORE RAG + LLM PIPELINE
-    ────────────────────────
-    1. Retrieve the most relevant syllabus context for the full transcript.
-       (For longer lectures we'd chunk the transcript and call per-chunk,
-        but for MVP we use the full transcript with a broad syllabus query.)
-    2. Build the final prompt: system instructions + syllabus context + transcript.
-    3. Call GPT-4o (or compatible model) and parse the JSON response.
-    """
-    if not LANGCHAIN_OK:
-        st.error("LangChain not installed. Run: pip install langchain langchain-openai langchain-community faiss-cpu")
-        return {}
-
-    # Retrieve relevant syllabus anchors using the full transcript as query
-    # In production: chunk transcript → retrieve per-chunk → merge
-    syllabus_context = retrieve_syllabus_context(vectorstore, transcript[:4000], k=8)
-
-    language_instruction = (
-        f"Write all notes and summaries in {target_language}. "
-        "Keep technical terms in English with translations in parentheses."
-        if target_language.lower() != "english"
-        else ""
-    )
-
-    human_message = f"""
-═══════════════════════════════════
-SYLLABUS CONTEXT (Ground Truth)
-═══════════════════════════════════
-{syllabus_context if syllabus_context else "[No syllabus provided — use content-based headers]"}
-
-═══════════════════════════════════
-RAW LECTURE TRANSCRIPT
-═══════════════════════════════════
-{transcript}
-
-═══════════════════════════════════
-INSTRUCTIONS
-═══════════════════════════════════
-{language_instruction}
-Apply all CORE DIRECTIVES. Return only the JSON object described in your system prompt.
-""".strip()
-
-    llm = ChatOpenAI(
-        model="gpt-4o",
-        temperature=0.2,         # low temp → factual, consistent structure
-        max_tokens=4096,
-        openai_api_key=api_key,
-    )
-
-    messages = [
-        SystemMessage(content=AUDORA_SYSTEM_PROMPT),
-        HumanMessage(content=human_message),
-    ]
-
-    response = llm.invoke(messages)
-    raw = response.content.strip()
-
-    # Strip any accidental markdown fences the model might add
+def _extract_json(raw: str) -> dict:
     raw = re.sub(r"^```(?:json)?\s*", "", raw)
     raw = re.sub(r"\s*```$", "", raw)
+    match = re.search(r"\{.*\}", raw, re.DOTALL)
+    if match:
+        raw = match.group(0)
 
     try:
         return json.loads(raw)
     except json.JSONDecodeError:
-        # Graceful degradation: return raw text as a note
         return {
             "title": "Lecture Notes",
-            "summary": "",
-            "notes": [{"module": "General", "content": raw}],
+            "summary": "Notes extracted from lecture transcript.",
+            "notes": [{"module": "General", "content": raw, "source_refs": []}],
             "exam_radar": [],
             "filtered_count": 0,
             "language": "en",
         }
 
 
+def _normalize_terms(text: str) -> set[str]:
+    terms = set()
+    for match in re.finditer(r"[A-Za-z0-9][A-Za-z0-9+/_-]{1,}", text or ""):
+        term = match.group(0).lower().strip("-_/")
+        if len(term) < 3:
+            continue
+        if term in STOPWORDS:
+            continue
+        if term.isdigit():
+            continue
+        terms.add(term)
+    return terms
+
+
+def _confidence_label(score: float) -> str:
+    if score >= 0.75:
+        return "HIGH"
+    if score >= 0.45:
+        return "MEDIUM"
+    return "LOW"
+
+
+def _module_alignment_score(module: str, syllabus_context: str) -> float:
+    module_text = (module or "").strip().lower()
+    syllabus_text = (syllabus_context or "").strip().lower()
+    if not module_text:
+        return 0.15 if syllabus_text else 0.2
+    if not syllabus_text:
+        return 0.35
+    if module_text in syllabus_text:
+        return 1.0
+
+    module_terms = _normalize_terms(module_text)
+    syllabus_terms = _normalize_terms(syllabus_text)
+    if not module_terms or not syllabus_terms:
+        return 0.3
+
+    overlap = len(module_terms & syllabus_terms)
+    ratio = overlap / max(len(module_terms), 1)
+    return min(1.0, 0.25 + ratio * 0.75)
+
+
+def _transcript_overlap_score(content: str, transcript_terms: set[str]) -> float:
+    content_terms = _normalize_terms(content)
+    if not content_terms or not transcript_terms:
+        return 0.0
+    overlap = len(content_terms & transcript_terms)
+    return min(1.0, overlap / max(len(content_terms), 1))
+
+
+def _specificity_score(content: str) -> float:
+    text = (content or "").strip()
+    if not text:
+        return 0.0
+    words = re.findall(r"[A-Za-z0-9][A-Za-z0-9+/_-]{1,}", text)
+    word_count = len(words)
+    score = 0.0
+    if word_count >= 45:
+        score = 1.0
+    elif word_count >= 30:
+        score = 0.85
+    elif word_count >= 18:
+        score = 0.7
+    elif word_count >= 10:
+        score = 0.5
+    elif word_count >= 5:
+        score = 0.25
+    else:
+        score = 0.1
+
+    if any(symbol in text for symbol in (":", "(", ")", "-", "•")):
+        score += 0.05
+    if re.search(r"\b\d+\b", text):
+        score += 0.05
+    return min(score, 1.0)
+
+
+def _generic_penalty(module: str, content: str, result: dict) -> float:
+    combined = f"{module or ''} {content or ''}".strip().lower()
+    penalty = 0.0
+    if not (content or "").strip():
+        penalty += 0.45
+    if (module or "").strip().lower() in {"general", "misc", "miscellaneous", "other", "overview"}:
+        penalty += 0.12
+    if len(_normalize_terms(content)) < 8:
+        penalty += 0.08
+    for phrase in GENERIC_NOTE_PHRASES:
+        if phrase in combined:
+            penalty += 0.05
+    if any(marker in combined for marker in ("{", "}", '"notes"', '"title"', '"summary"')):
+        penalty += 0.15
+    if len(result.get("notes", [])) == 1 and not (result.get("summary") or "").strip():
+        penalty += 0.05
+    return min(penalty, 0.4)
+
+
+def _build_confidence_reason(module_score: float, transcript_score: float, specificity_score: float, penalty: float, label: str) -> str:
+    parts = []
+    if module_score >= 0.75:
+        parts.append("strong syllabus alignment")
+    elif module_score >= 0.45:
+        parts.append("partial syllabus alignment")
+    else:
+        parts.append("weak syllabus alignment")
+
+    if transcript_score >= 0.5:
+        parts.append("good transcript overlap")
+    elif transcript_score >= 0.25:
+        parts.append("moderate transcript overlap")
+    else:
+        parts.append("limited transcript overlap")
+
+    if specificity_score >= 0.75:
+        parts.append("specific content")
+    elif specificity_score >= 0.4:
+        parts.append("moderately specific content")
+    else:
+        parts.append("short or generic content")
+
+    if penalty >= 0.15:
+        parts.append("generic/fallback penalty applied")
+
+    parts.append(f"label {label}")
+    return "; ".join(parts)
+
+
+def enrich_notes_with_confidence(result, transcript, syllabus_context) -> dict:
+    enriched = dict(result or {})
+    notes = enriched.get("notes", [])
+    if not isinstance(notes, list):
+        notes = []
+
+    transcript_terms = _normalize_terms(transcript or "")
+    syllabus_text = syllabus_context or ""
+
+    normalized_notes = []
+    for note in notes:
+        if not isinstance(note, dict):
+            note = {"module": "General", "content": str(note)}
+
+        module = str(note.get("module", "General") or "General")
+        content = str(note.get("content", "") or "")
+        source_refs = note.get("source_refs", [])
+        if not isinstance(source_refs, list):
+            source_refs = []
+
+        module_score = _module_alignment_score(module, syllabus_text)
+        transcript_score = _transcript_overlap_score(content, transcript_terms)
+        specificity_score = _specificity_score(content)
+        penalty = _generic_penalty(module, content, enriched)
+
+        raw_score = (module_score * 0.4) + (transcript_score * 0.35) + (specificity_score * 0.25) - penalty
+        score = max(0.0, min(1.0, round(raw_score, 2)))
+        label = _confidence_label(score)
+        reason = _build_confidence_reason(module_score, transcript_score, specificity_score, penalty, label)
+
+        normalized_note = dict(note)
+        normalized_note["module"] = module
+        normalized_note["content"] = content
+        normalized_note["source_refs"] = source_refs
+        normalized_note["confidence_score"] = score
+        normalized_note["confidence_label"] = label
+        normalized_note["confidence_reason"] = reason
+        normalized_notes.append(normalized_note)
+
+    enriched["notes"] = normalized_notes
+    return enriched
+
+
+def generate_notes_with_groq(transcript: str, syllabus_context: str, groq_key: str, target_language: str) -> dict:
+    if not GROQ_OK:
+        raise RuntimeError("groq package not installed. Run: pip install groq")
+
+    language_line = (
+        f"Write ALL notes and summary in {target_language}. Keep technical terms in English with translations in parentheses."
+        if target_language.lower() != "english"
+        else ""
+    )
+
+    prompt = f"""{AUDORA_SYSTEM_PROMPT}
+
+SYLLABUS CONTEXT
+{syllabus_context if syllabus_context else "[No syllabus uploaded]"}
+
+RAW TRANSCRIPT
+{transcript}
+
+FINAL INSTRUCTION
+{language_line}
+Apply all directives and return only the JSON object.
+"""
+
+    client = Groq(api_key=groq_key)
+    response = client.chat.completions.create(
+        model="llama-3.3-70b-versatile",
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.2,
+        max_tokens=4096,
+    )
+    return _extract_json(response.choices[0].message.content.strip())
+
+
+def generate_notes_with_openai(transcript: str, syllabus_context: str, api_key: str, target_language: str) -> dict:
+    language_line = (
+        f"Write ALL notes and summary in {target_language}. Keep technical terms in English with translations in parentheses."
+        if target_language.lower() != "english"
+        else ""
+    )
+
+    human = f"""
+SYLLABUS CONTEXT
+{syllabus_context if syllabus_context else "[No syllabus uploaded]"}
+
+RAW TRANSCRIPT
+{transcript}
+
+FINAL INSTRUCTION
+{language_line}
+Apply all directives and return only the JSON object.
+""".strip()
+
+    if LANGCHAIN_OK:
+        llm = ChatOpenAI(
+            model="gpt-4o",
+            temperature=0.2,
+            max_tokens=4096,
+            openai_api_key=api_key,
+        )
+        messages = [SystemMessage(content=AUDORA_SYSTEM_PROMPT), HumanMessage(content=human)]
+        response = llm.invoke(messages)
+        return _extract_json(response.content.strip())
+
+    if not OPENAI_OK:
+        raise RuntimeError("Neither langchain-openai nor openai package is available.")
+
+    client = openai.OpenAI(api_key=api_key)
+    response = client.chat.completions.create(
+        model="gpt-4o",
+        temperature=0.2,
+        messages=[
+            {"role": "system", "content": AUDORA_SYSTEM_PROMPT},
+            {"role": "user", "content": human},
+        ],
+    )
+    return _extract_json(response.choices[0].message.content.strip())
+
+
 def notes_to_speech(notes_text: str, lang_code: str = "en") -> bytes:
-    """
-    TEXT-TO-SPEECH ACCESSIBILITY LAYER
-    ────────────────────────────────────
-    Converts the clean notes into an MP3 audio stream using gTTS.
-    Strips markdown symbols before synthesis so the audio is clean.
-    Returns raw MP3 bytes for st.audio().
-    """
-    if not GTTS_OK:
+    if not GTTS_OK or not notes_text.strip():
         return b""
 
-    # Strip markdown formatting for clean TTS
-    clean = re.sub(r"#+\s*", "", notes_text)      # remove headers
-    clean = re.sub(r"\*+([^*]+)\*+", r"\1", clean)  # remove bold/italic
-    clean = re.sub(r"`[^`]+`", "", clean)           # remove inline code
-    clean = re.sub(r"[-•]\s*", "", clean)           # remove bullets
-    clean = re.sub(r"\n{2,}", ". ", clean)          # double newlines → pause
+    clean = notes_text
+    clean = re.sub(r"#+\s*", "", clean)
+    clean = re.sub(r"\*+([^*]+)\*+", r"\1", clean)
+    clean = re.sub(r"`[^`]+`", "", clean)
+    clean = re.sub(r"[-•]\s*", "", clean)
+    clean = re.sub(r"\n{2,}", ". ", clean)
     clean = re.sub(r"\n", " ", clean).strip()
-
-    # Truncate for MVP (gTTS has no hard limit but very long text is slow)
     clean = clean[:5000]
 
-    tts = gTTS(text=clean, lang=lang_code, slow=False)
-    buf = BytesIO()
-    tts.write_to_fp(buf)
-    buf.seek(0)
-    return buf.read()
+    try:
+        tts = gTTS(text=clean, lang=lang_code, slow=False)
+        buf = BytesIO()
+        tts.write_to_fp(buf)
+        buf.seek(0)
+        return buf.read()
+    except Exception as e:
+        st.warning(f"TTS failed: {e}")
+        return b""
 
 
-def flatten_notes_to_text(result: dict) -> str:
-    """Flatten the structured JSON notes into a single readable string for TTS."""
+def flatten_notes(result: dict) -> str:
     parts = []
-    if result.get("summary"):
-        parts.append(f"Summary: {result['summary']}")
+    summary = result.get("summary", "")
+    if summary:
+        parts.append(f"Summary. {summary}")
     for note in result.get("notes", []):
-        parts.append(f"\n\n{note['module']}.\n{note['content']}")
-    return "\n".join(parts)
+        parts.append(f"{note.get('module', '')}. {note.get('content', '')}")
+    return "\n\n".join(parts)
 
-
-# Language map: display name → (ISO 639-1, gTTS lang code)
-LANGUAGES = {
-    "English":    ("en", "en"),
-    "Spanish":    ("es", "es"),
-    "French":     ("fr", "fr"),
-    "German":     ("de", "de"),
-    "Arabic":     ("ar", "ar"),
-    "Urdu":       ("ur", "ur"),
-    "Hindi":      ("hi", "hi"),
-    "Mandarin":   ("zh", "zh"),
-    "Portuguese": ("pt", "pt"),
-    "Japanese":   ("ja", "ja"),
-}
-
-# ══════════════════════════════════════════════════════════════════════════════
-# SIDEBAR — CONFIGURATION
-# ══════════════════════════════════════════════════════════════════════════════
 
 with st.sidebar:
-    st.markdown('<div class="audora-wordmark">AUDORA</div>', unsafe_allow_html=True)
-    st.markdown('<div class="audora-tagline">Lecture Intelligence</div>', unsafe_allow_html=True)
-    st.divider()
-
-    # API Key input — secure, never logged
-    st.markdown("### ⚙️ Configuration")
-    api_key_input = st.text_input(
-        "OpenAI API Key",
-        type="password",
-        placeholder="sk-...",
-        help="Your key is used only for this session and never stored.",
-        key="api_key",
-    )
-    # Merge env key with UI input
-    api_key = api_key_input or get_api_key()
-
-    st.divider()
-
-    # Language selector
-    st.markdown("### 🌐 Output Language")
-    selected_language = st.selectbox(
-        "Target language for notes",
-        options=list(LANGUAGES.keys()),
-        index=0,
-        help="Notes will be translated into this language. Technical terms remain in English.",
-        label_visibility="collapsed",
-    )
-
-    st.divider()
-
-    # Accessibility options
-    st.markdown("### ♿ Accessibility")
-    enable_tts = st.checkbox(
-        "Generate audio version of notes",
-        value=True,
-        help="Creates an MP3 of the clean notes for screen reader / listening use.",
-    )
-
-    st.divider()
+    st.markdown('<div class="audora-wordmark-sidebar">AUDORA</div>', unsafe_allow_html=True)
     st.markdown(
-        '<p style="font-size:0.7rem;color:#555;font-family:\'DM Mono\',monospace;">'
-        'Audora v0.1 MVP · GPT-4o + Whisper + FAISS</p>',
+        '<div class="audora-tagline">Curriculum Grounded AI for Automated Lecture Synthesis</div>',
         unsafe_allow_html=True,
     )
+    st.divider()
+
+    st.markdown("### Model Provider")
+    provider_label = st.radio(
+        "Select provider",
+        options=["Groq (Free)", "OpenAI (Paid)"],
+        index=0,
+        help="Use Groq for a free flow or OpenAI for paid GPT-4o + Whisper flow.",
+    )
+    provider = "groq" if provider_label.startswith("Groq") else "openai"
+
+    if provider == "groq":
+        key_input = st.text_input(
+            "Groq API Key",
+            type="password",
+            placeholder="gsk_...",
+            key="groq_key",
+            help="Free key from console.groq.com",
+        )
+        api_key = key_input or get_env_key("GROQ_API_KEY")
+    else:
+        key_input = st.text_input(
+            "OpenAI API Key",
+            type="password",
+            placeholder="sk-...",
+            key="openai_key",
+            help="Paid key from OpenAI dashboard",
+        )
+        api_key = key_input or get_env_key("OPENAI_API_KEY")
+
+    st.divider()
+    st.markdown("### Output Language")
+    selected_language = st.selectbox("Target language", options=list(LANGUAGES.keys()), index=0, label_visibility="collapsed")
+
+    st.divider()
+    st.markdown("### Accessibility")
+    enable_tts = st.checkbox("Generate audio notes (gTTS)", value=True)
+
+    st.divider()
+    st.markdown("### Dependency Status")
+
+    checks = [
+        ("PyPDF2", PYPDF2_OK, PYPDF2_ERROR),
+        (
+            "OCR stack (pypdfium2 + pytesseract + Pillow)",
+            PDFIUM_OK and PIL_OK and PYTESSERACT_OK and TESSERACT_RUNTIME_OK,
+            PDFIUM_ERROR or PIL_ERROR or PYTESSERACT_ERROR or TESSERACT_RUNTIME_ERROR,
+        ),
+        ("gTTS", GTTS_OK, GTTS_ERROR),
+        ("pydub (large file chunking)", PYDUB_OK, PYDUB_ERROR),
+    ]
+
+    if provider == "groq":
+        checks.extend(
+            [
+                ("groq", GROQ_OK, GROQ_ERROR),
+                ("sentence-transformers", SBERT_OK, SBERT_ERROR),
+                ("faiss-cpu / numpy", FAISS_OK, FAISS_ERROR),
+            ]
+        )
+    else:
+        checks.extend(
+            [
+                ("openai", OPENAI_OK, OPENAI_ERROR),
+                ("langchain-openai", LANGCHAIN_OK, LANGCHAIN_ERROR),
+            ]
+        )
+
+    for label, ok, err in checks:
+        icon = "✅" if ok else "❌"
+        st.markdown(f"{icon} {label}")
+        if not ok and err:
+            st.caption(err)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# MAIN INTERFACE
-# ══════════════════════════════════════════════════════════════════════════════
-
-# ── Hero header ───────────────────────────────────────────────────────────────
 st.markdown(
     '<h1 class="audora-wordmark" role="heading" aria-level="1">AUDORA</h1>',
     unsafe_allow_html=True,
 )
 st.markdown(
-    '<p class="audora-tagline">Syllabus-Aware Lecture Intelligence · Turn audio into A+ notes</p>',
+    '<p class="audora-tagline">Curriculum Grounded AI for Automated Lecture Synthesis</p>',
     unsafe_allow_html=True,
 )
 st.divider()
 
-# ── Dependency check banner ───────────────────────────────────────────────────
-missing = []
-if not LANGCHAIN_OK: missing.append("`langchain langchain-openai langchain-community faiss-cpu`")
-if not PYPDF2_OK:    missing.append("`PyPDF2`")
-if not GTTS_OK:      missing.append("`gTTS`")
-if openai is None:   missing.append("`openai`")
+if provider == "groq":
+    required_ok = GROQ_OK and SBERT_OK and FAISS_OK
+    if not required_ok:
+        st.error(
+            "Missing packages for Groq mode. Install and restart:\n\n"
+            "```bash\n"
+            "pip install groq sentence-transformers faiss-cpu numpy PyPDF2 gTTS streamlit python-dotenv\n"
+            "```"
+        )
+else:
+    required_ok = OPENAI_OK and LANGCHAIN_OK
+    if not required_ok:
+        st.error(
+            "Missing packages for OpenAI mode. Install and restart:\n\n"
+            "```bash\n"
+            "pip install openai langchain langchain-openai langchain-community langchain-text-splitters faiss-cpu PyPDF2 gTTS streamlit python-dotenv\n"
+            "```"
+        )
 
-if missing:
-    extra = []
-    if not LANGCHAIN_OK and LANGCHAIN_IMPORT_ERROR:
-        extra.append(f"LangChain import error: {LANGCHAIN_IMPORT_ERROR}")
-    if openai is None and OPENAI_IMPORT_ERROR:
-        extra.append(f"openai import error: {OPENAI_IMPORT_ERROR}")
-    warning_text = (
-        "**Missing dependencies.** Install them and restart:\n\n"
-        "```bash\npip install openai langchain langchain-openai langchain-community "
-        "faiss-cpu PyPDF2 gTTS streamlit\n```"
-    )
-    if extra:
-        warning_text += "\n\nImport details:\n" + "\n".join(extra)
-    st.warning(warning_text, icon="⚠️")
+left_col, right_col = st.columns(2, gap="large")
 
-# ── Upload columns ─────────────────────────────────────────────────────────────
-col_left, col_right = st.columns(2, gap="large")
-
-with col_left:
-    st.markdown(
-        '<div class="section-label" role="heading" aria-level="2">📄 Course Syllabus</div>',
-        unsafe_allow_html=True,
-    )
+with left_col:
+    st.markdown('<div class="section-label">Course Syllabus (Optional)</div>', unsafe_allow_html=True)
     syllabus_file = st.file_uploader(
-        "Upload Syllabus (PDF or TXT)",
+        "Upload syllabus (PDF or TXT)",
         type=["pdf", "txt"],
         key="syllabus",
-        label_visibility="visible",
-        help="The syllabus is vectorized and used as ground truth for note structure.",
     )
 
-with col_right:
-    st.markdown(
-        '<div class="section-label" role="heading" aria-level="2">🎙️ Lecture Recording</div>',
-        unsafe_allow_html=True,
-    )
+with right_col:
+    st.markdown('<div class="section-label">Lecture Recording</div>', unsafe_allow_html=True)
     audio_file = st.file_uploader(
-        "Upload Lecture (MP3 or MP4)",
-        type=["mp3", "mp4", "m4a", "wav"],
+        "Upload lecture (audio/video)",
+        type=["mp3", "mp4", "m4a", "wav", "ogg", "flac", "webm", "mpeg", "mpga"],
         key="audio",
-        label_visibility="visible",
-        help="Audio is transcribed with OpenAI Whisper. Mixed-language recordings are supported.",
     )
+    if audio_file:
+        size_mb = len(audio_file.getvalue()) / (1024 * 1024)
+        st.caption(f"{audio_file.name} - {size_mb:.1f} MB")
 
 st.divider()
 
-# ── Process button ─────────────────────────────────────────────────────────────
 _, btn_col, _ = st.columns([2, 3, 2])
 with btn_col:
+    can_run = bool(api_key) and bool(audio_file) and required_ok
     run_button = st.button(
-        "⚡ Generate Notes",
-        disabled=not (audio_file and api_key),
-        help="Upload a lecture recording and provide your API key to begin.",
+        "Generate Notes",
+        disabled=not can_run,
         use_container_width=True,
     )
 
 if not api_key:
-    st.info("👈 Enter your OpenAI API key in the sidebar to get started.", icon="🔑")
+    if provider == "groq":
+        st.info("Add your Groq key in the sidebar to continue.")
+    else:
+        st.info("Add your OpenAI key in the sidebar to continue.")
+elif not audio_file:
+    st.info("Upload a lecture recording to continue.")
 
-# ══════════════════════════════════════════════════════════════════════════════
-# PROCESSING PIPELINE
-# ══════════════════════════════════════════════════════════════════════════════
-
-if run_button and audio_file and api_key:
-
+if run_button and can_run:
     result = {}
-    progress = st.progress(0, text="Initialising…")
+    transcript = ""
+    progress = st.progress(0, text="Starting pipeline...")
 
-    # ── STEP 1: Syllabus vectorization ─────────────────────────────────────
-    vectorstore = None
+    vector_store = None
     if syllabus_file:
-        progress.progress(10, text="📚 Vectorizing syllabus…")
+        progress.progress(10, text="Processing syllabus...")
         try:
-            raw_bytes = syllabus_file.read()
-            if syllabus_file.name.endswith(".pdf"):
-                syllabus_text = extract_pdf_text(raw_bytes)
-            else:
-                syllabus_text = raw_bytes.decode("utf-8", errors="replace")
+            raw = syllabus_file.read()
+            syllabus_text = (
+                extract_pdf_text_with_ocr(raw)
+                if syllabus_file.name.lower().endswith(".pdf")
+                else raw.decode("utf-8", errors="replace")
+            )
 
             if syllabus_text.strip():
-                vectorstore = build_syllabus_vectorstore(syllabus_text, api_key)
-                st.toast("✅ Syllabus vectorized successfully", icon="📚")
+                if provider == "groq":
+                    vector_store = build_groq_vector_store(syllabus_text)
+                else:
+                    vector_store = build_openai_vector_store(syllabus_text, api_key)
+                if vector_store is not None:
+                    st.toast("Syllabus indexed successfully", icon="📚")
             else:
-                st.warning("Could not extract text from syllabus — proceeding without it.")
+                st.warning("Could not extract readable syllabus text. Continuing without syllabus context.")
         except Exception as e:
-            st.warning(f"Syllabus processing error: {e}. Continuing without syllabus context.")
-    else:
-        st.info("No syllabus uploaded — notes will use content-based headers.", icon="ℹ️")
+            st.warning(f"Syllabus processing issue: {e}")
 
-    # ── STEP 2: Audio transcription ─────────────────────────────────────────
-    progress.progress(30, text="🎙️ Transcribing lecture with Whisper…")
+    progress.progress(35, text="Transcribing lecture...")
     try:
-        audio_bytes = audio_file.read()
-        transcript = transcribe_audio(audio_bytes, api_key, filename=audio_file.name)
+        audio_bytes = audio_file.getvalue()
+
+        def on_transcription_progress(stage: str, current: int = 0, total: int = 0):
+            if stage == "preparing":
+                progress.progress(36, text="Preparing chunks...")
+            elif stage == "chunk" and total > 0:
+                base = 36
+                span = 20
+                pct = base + int((current / total) * span)
+                progress.progress(min(58, pct), text=f"Transcribing chunk {current} of {total}")
+            elif stage == "merging":
+                progress.progress(59, text="Merging transcripts...")
+
+        transcript = transcribe_audio_orchestrator(
+            audio_bytes=audio_bytes,
+            filename=audio_file.name,
+            provider=provider,
+            api_key=api_key,
+            progress_callback=on_transcription_progress,
+        )
+
         if not transcript:
-            st.error("Transcription returned empty. Check your API key and audio file.")
+            st.error("Transcription returned empty output.")
             st.stop()
-        st.toast("✅ Transcription complete", icon="🎙️")
     except Exception as e:
-        st.error(f"Transcription failed ({type(e).__name__}): {e}")
-        with st.expander("Transcription debug details"):
+        st.error(f"Transcription failed: {e}")
+        with st.expander("Debug details"):
             st.code(traceback.format_exc())
         st.stop()
 
-    # ── STEP 3: LLM reasoning + note generation ─────────────────────────────
-    progress.progress(55, text="🧠 Analysing lecture & generating notes…")
+    progress.progress(60, text="Retrieving syllabus context...")
+    syllabus_context = get_syllabus_context(vector_store, transcript[:4000], provider)
+
+    progress.progress(78, text="Generating structured notes...")
     try:
-        lang_code, tts_code = LANGUAGES[selected_language]
-        result = run_audora_chain(
-            transcript=transcript,
-            vectorstore=vectorstore,
-            api_key=api_key,
-            target_language=selected_language,
-        )
-        st.toast("✅ Notes generated", icon="🧠")
+        if provider == "groq":
+            result = generate_notes_with_groq(transcript, syllabus_context, api_key, selected_language)
+        else:
+            result = generate_notes_with_openai(transcript, syllabus_context, api_key, selected_language)
+        result = enrich_notes_with_confidence(result, transcript, syllabus_context)
     except Exception as e:
-        st.error(f"LLM processing failed: {e}")
+        st.error(f"Note generation failed: {e}")
+        with st.expander("Debug details"):
+            st.code(traceback.format_exc())
         st.stop()
 
-    # ── STEP 4: TTS synthesis ────────────────────────────────────────────────
-    audio_data = b""
-    if enable_tts and GTTS_OK and result:
-        progress.progress(80, text="🔊 Synthesising audio notes…")
-        try:
-            notes_text = flatten_notes_to_text(result)
-            audio_data = notes_to_speech(notes_text, lang_code=tts_code)
-            st.toast("✅ Audio notes ready", icon="🔊")
-        except Exception as e:
-            st.warning(f"TTS synthesis failed: {e}. Text notes still available.")
+    _, tts_lang = LANGUAGES[selected_language]
+    audio_out = b""
+    if enable_tts and GTTS_OK:
+        progress.progress(92, text="Generating audio notes...")
+        audio_out = notes_to_speech(flatten_notes(result), tts_lang)
 
-    progress.progress(100, text="✅ Done!")
-
-    # ══════════════════════════════════════════════════════════════════════════
-    # RESULTS DISPLAY
-    # ══════════════════════════════════════════════════════════════════════════
+    progress.progress(100, text="Done")
 
     st.divider()
 
-    # ── Lecture title & summary ───────────────────────────────────────────────
     title = result.get("title", "Lecture Notes")
     summary = result.get("summary", "")
+    notes = result.get("notes", [])
+    exam_hints = result.get("exam_radar", [])
     filtered_count = result.get("filtered_count", 0)
 
     st.markdown(
-        f'<h2 style="font-family:\'Syne\',sans-serif;font-size:1.8rem;font-weight:800;'
-        f'color:#e8eaf2;" role="heading" aria-level="2">{title}</h2>',
+        f"<h2 style='font-family:Syne,sans-serif;font-size:1.75rem;font-weight:800;color:#e8eaf2;'>{title}</h2>",
         unsafe_allow_html=True,
     )
 
-    meta_cols = st.columns(3)
-    meta_cols[0].metric("Language", selected_language)
-    meta_cols[1].metric("Noise Segments Removed", filtered_count)
-    meta_cols[2].metric("Exam Hints Found", len(result.get("exam_radar", [])))
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Provider", "Groq" if provider == "groq" else "OpenAI")
+    c2.metric("Language", selected_language)
+    c3.metric("Noise Removed", filtered_count)
+    c4.metric("Exam Hints", len(exam_hints))
 
     if summary:
         st.markdown(
-            f'<div class="card card-accent" role="region" aria-label="Lecture summary">'
-            f'<div class="section-label">Executive Summary</div>'
-            f'<p style="margin:0;line-height:1.7">{summary}</p>'
-            f'</div>',
+            f"<div class='card card-green'><div class='section-label'>Executive Summary</div><p style='margin:0;line-height:1.7'>{summary}</p></div>",
             unsafe_allow_html=True,
         )
 
     st.divider()
 
-    # ── Main layout: notes + radar ─────────────────────────────────────────────
     notes_col, radar_col = st.columns([3, 2], gap="large")
 
-    # ── CLEAN NOTES ────────────────────────────────────────────────────────────
     with notes_col:
-        st.markdown(
-            '<div class="section-label" role="heading" aria-level="3">📝 Clean Study Notes</div>',
-            unsafe_allow_html=True,
-        )
-
-        notes = result.get("notes", [])
+        st.markdown('<div class="section-label">Clean Study Notes</div>', unsafe_allow_html=True)
         if notes:
             for note in notes:
-                module_name = note.get("module", "General")
+                module = note.get("module", "General")
                 content = note.get("content", "")
+                confidence_label = str(note.get("confidence_label", "LOW")).upper()
+                confidence_score = float(note.get("confidence_score", 0.0) or 0.0)
+                confidence_reason = note.get("confidence_reason", "")
+                source_refs = note.get("source_refs", [])
+                confidence_class = "confidence-high" if confidence_label == "HIGH" else "confidence-med" if confidence_label == "MEDIUM" else "confidence-low"
+                source_ref_text = ", ".join(str(ref) for ref in source_refs) if source_refs else ""
+                source_refs_html = (
+                    f"<p class='confidence-reason'>Source refs: {html.escape(source_ref_text)}</p>" if source_ref_text else ""
+                )
+                card_html = (
+                    f"<div class='card'>"
+                    f"<div class='section-label'>{html.escape(str(module))}</div>"
+                    f"<div class='confidence-row'>"
+                    f"<span class='rbadge {confidence_class}'>Confidence {html.escape(confidence_label)}</span>"
+                    f"<span class='rbadge rbadge-mod'>{confidence_score:.2f}</span>"
+                    f"</div>"
+                    f"<div class='notes-body'>{content}</div>"
+                    f"<p class='confidence-reason'>{html.escape(confidence_reason)}</p>"
+                    f"{source_refs_html}"
+                    f"</div>"
+                )
                 st.markdown(
-                    f'<div class="card" role="region" aria-label="Notes for {module_name}">'
-                    f'<div class="section-label">{module_name}</div>'
-                    f'<div class="notes-body">{content}</div>'
-                    f'</div>',
+                    card_html,
                     unsafe_allow_html=True,
                 )
         else:
-            st.info("No structured notes were generated.")
+            st.info("No structured notes were returned.")
 
-        # ── Audio notes player ─────────────────────────────────────────────
-        if audio_data:
+        if audio_out:
             st.divider()
-            st.markdown(
-                '<div class="section-label" role="heading" aria-level="3">🔊 Audio Notes (Accessibility)</div>',
-                unsafe_allow_html=True,
-            )
-            st.markdown(
-                '<p style="font-size:0.85rem;color:#7b82a0;margin-bottom:0.75rem;">'
-                'Listen to your study notes — optimised for screen readers and auditory learners.</p>',
-                unsafe_allow_html=True,
-            )
-            st.audio(audio_data, format="audio/mp3")
+            st.markdown('<div class="section-label">Audio Notes</div>', unsafe_allow_html=True)
+            st.audio(audio_out, format="audio/mp3")
 
-    # ── EXAM RADAR ─────────────────────────────────────────────────────────────
     with radar_col:
-        st.markdown(
-            '<div class="section-label" role="heading" aria-level="3">🎯 Exam Radar</div>',
-            unsafe_allow_html=True,
-        )
-
-        exam_hints = result.get("exam_radar", [])
+        st.markdown('<div class="section-label">Exam Radar</div>', unsafe_allow_html=True)
         if exam_hints:
             for hint in exam_hints:
                 urgency = hint.get("urgency", "MEDIUM").upper()
-                badge_class = "radar-high" if urgency == "HIGH" else "radar-med"
+                badge_class = "rbadge-high" if urgency == "HIGH" else "rbadge-med"
                 module = hint.get("module", "")
                 hint_text = hint.get("hint", "")
                 reason = hint.get("reason", "")
-
                 st.markdown(
-                    f'<div class="card card-danger" role="alert" aria-label="Exam hint: {hint_text}">'
-                    f'<span class="radar-badge {badge_class}">{urgency}</span>'
-                    f'<span class="radar-badge" style="color:#7b82a0;border-color:#252b3a">{module}</span>'
-                    f'<p style="margin:0.6rem 0 0.3rem;font-weight:500">{hint_text}</p>'
-                    f'<p style="font-size:0.8rem;color:#7b82a0;margin:0">{reason}</p>'
-                    f'</div>',
+                    f"<div class='card card-red'>"
+                    f"<span class='rbadge {badge_class}'>{urgency}</span>"
+                    f"<span class='rbadge rbadge-mod'>{module}</span>"
+                    f"<p style='margin:0.55rem 0 0.25rem;font-weight:500;font-size:0.95rem;'>{hint_text}</p>"
+                    f"<p style='font-size:0.78rem;color:#7b82a0;margin:0;'>{reason}</p>"
+                    f"</div>",
                     unsafe_allow_html=True,
                 )
         else:
             st.markdown(
-                '<div class="card" style="text-align:center;color:#7b82a0">'
-                '<p style="font-size:2rem;margin-bottom:0.5rem">✅</p>'
-                '<p style="margin:0">No specific exam hints detected in this lecture.</p>'
-                '</div>',
+                "<div class='card' style='text-align:center;color:#7b82a0;padding:2rem;'>"
+                "<p style='font-size:1.8rem;margin-bottom:0.5rem;'>✅</p>"
+                "<p style='margin:0;font-size:0.9rem;'>No exam hints detected.</p>"
+                "</div>",
                 unsafe_allow_html=True,
             )
 
-        # ── Raw transcript expander ────────────────────────────────────────
         st.divider()
-        with st.expander("📜 View Raw Transcript", expanded=False):
+        with st.expander("Raw Transcript", expanded=False):
+            preview = transcript[:3000] + ("..." if len(transcript) > 3000 else "")
             st.markdown(
-                f'<div style="font-family:\'DM Mono\',monospace;font-size:0.8rem;'
-                f'color:#7b82a0;line-height:1.7;white-space:pre-wrap;">'
-                f'{transcript[:3000]}{"…" if len(transcript) > 3000 else ""}'
-                f'</div>',
+                f"<div style='font-family:DM Mono,monospace;font-size:0.78rem;color:#7b82a0;line-height:1.7;white-space:pre-wrap;'>{preview}</div>",
                 unsafe_allow_html=True,
             )
 
-    # ── Download notes as markdown ──────────────────────────────────────────
     st.divider()
-    dl_col1, dl_col2, _ = st.columns([2, 2, 3])
+    dl1, dl2, dl3, _ = st.columns([2, 2, 2, 1])
 
-    all_notes_md = f"# {title}\n\n**Summary:** {summary}\n\n"
-    for note in result.get("notes", []):
-        all_notes_md += f"## {note['module']}\n\n{note['content']}\n\n"
+    md_notes = f"# {title}\n\n**Summary:** {summary}\n\n"
+    for n in notes:
+        confidence_label = str(n.get('confidence_label', 'LOW')).upper()
+        confidence_score = float(n.get('confidence_score', 0.0) or 0.0)
+        md_notes += (
+            f"## {n.get('module', '')}\n\n"
+            f"**Confidence:** {confidence_label} ({confidence_score:.2f})\n\n"
+            f"**Reason:** {n.get('confidence_reason', '')}\n\n"
+            f"{n.get('content', '')}\n\n"
+        )
+        source_refs = n.get('source_refs', [])
+        if source_refs:
+            md_notes += f"**Source refs:** {', '.join(str(ref) for ref in source_refs)}\n\n"
+
     if exam_hints:
-        all_notes_md += "## 🎯 Exam Radar\n\n"
+        md_notes += "## Exam Radar\n\n"
         for h in exam_hints:
-            all_notes_md += f"- **[{h.get('urgency')}]** {h.get('hint')} *(Module: {h.get('module')})*\n"
+            md_notes += f"- **[{h.get('urgency')}]** {h.get('hint')} *(Module: {h.get('module')})*\n"
 
-    with dl_col1:
+    safe_title = re.sub(r"[^a-zA-Z0-9_]", "_", title[:28])
+
+    with dl1:
         st.download_button(
-            label="⬇️ Download Notes (Markdown)",
-            data=all_notes_md,
-            file_name=f"audora_{title[:30].replace(' ','_')}.md",
+            "Download Notes (Markdown)",
+            data=md_notes,
+            file_name=f"audora_{safe_title}.md",
             mime="text/markdown",
             use_container_width=True,
         )
 
-    with dl_col2:
+    with dl2:
         st.download_button(
-            label="⬇️ Download Raw JSON",
+            "Download Raw JSON",
             data=json.dumps(result, indent=2, ensure_ascii=False),
             file_name="audora_result.json",
             mime="application/json",
             use_container_width=True,
         )
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# EMPTY STATE
-# ══════════════════════════════════════════════════════════════════════════════
+    with dl3:
+        st.download_button(
+            "Download Transcript",
+            data=transcript,
+            file_name=f"transcript_{safe_title}.txt",
+            mime="text/plain",
+            use_container_width=True,
+        )
 
 elif not run_button:
     st.markdown(
-        '<div class="card" style="text-align:center;padding:3rem;">'
-        '<p style="font-size:3rem;margin-bottom:1rem">🎓</p>'
-        '<h3 style="font-family:\'Syne\',sans-serif;font-weight:700;color:#e8eaf2;margin-bottom:0.5rem">'
-        'Upload your materials to begin</h3>'
-        '<p style="color:#7b82a0;max-width:480px;margin:0 auto;">'
-        'Audora transforms raw lecture audio into structured, syllabus-aligned study notes. '
-        'Upload your lecture recording (MP3/MP4) and optionally your course syllabus (PDF) '
-        'to generate AI-powered clean notes with Exam Radar alerts.'
-        '</p>'
-        '</div>',
+        "<div class='card' style='text-align:center;padding:2.5rem 2rem;'>"
+        "<p style='font-size:2.8rem;margin-bottom:0.8rem;'>🎓</p>"
+        "<h3 style='font-family:Syne,sans-serif;font-weight:800;color:#e8eaf2;margin-bottom:0.6rem;'>"
+        "Automated Lecture Synthesis"
+        "</h3>"
+        "<p style='color:#7b82a0;max-width:560px;margin:0 auto;line-height:1.75;font-size:0.92rem;'>"
+        "Choose Groq (free) or OpenAI (paid) from the sidebar, add your key, upload lecture audio/video, and generate syllabus-aware notes with exam hints."
+        "</p>"
+        "</div>",
         unsafe_allow_html=True,
     )

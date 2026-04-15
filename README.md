@@ -1,15 +1,18 @@
 # Audora 🎓
 
-Syllabus-aware lecture intelligence for students on a budget.
+Syllabus-aware lecture intelligence with one unified Streamlit app and dual model providers.
 
 Audora turns lecture audio/video into clean study notes, maps content to your syllabus modules, flags exam hints, and can read notes back as audio.
 
-## ✨ Stack (Free-First)
+## ✨ Stack (Unified)
 
-- Transcription: **Groq Whisper API** (`whisper-large-v3-turbo`)
-- Note generation: **Groq LLaMA 3.3 70B** (`llama-3.3-70b-versatile`)
-- Syllabus retrieval: **Sentence-Transformers + FAISS (local)**
-- PDF extraction: **PyPDF2**
+- Free mode (Groq): **Groq Whisper + Groq LLaMA 3.3 70B**
+- Paid mode (OpenAI): **OpenAI Whisper + GPT-4o**
+- Syllabus retrieval:
+   - Groq mode: **Sentence-Transformers + FAISS (local)**
+   - OpenAI mode: **OpenAI Embeddings + FAISS (LangChain)**
+- PDF extraction: **PyPDF2 + OCR fallback for scanned PDFs**
+- OCR stack: **pypdfium2 + pytesseract + Pillow**
 - Audio notes (TTS): **gTTS**
 - UI: **Streamlit**
 
@@ -40,14 +43,20 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-4. Set Groq key (or paste in sidebar):
+4. Set key for your preferred mode (or paste in sidebar):
 
 ```bash
-# Windows PowerShell
+# Windows PowerShell (Groq free mode)
 $env:GROQ_API_KEY="gsk_..."
 
-# macOS/Linux
+# Windows PowerShell (OpenAI paid mode)
+$env:OPENAI_API_KEY="sk-..."
+
+# macOS/Linux (Groq free mode)
 export GROQ_API_KEY="gsk_..."
+
+# macOS/Linux (OpenAI paid mode)
+export OPENAI_API_KEY="sk-..."
 ```
 
 5. Run:
@@ -56,12 +65,22 @@ export GROQ_API_KEY="gsk_..."
 streamlit run app.py
 ```
 
+## 🔑 Provider Toggle
+
+In the sidebar, choose:
+
+- **Groq (Free)** for no-cost transcription + note generation
+- **OpenAI (Paid)** for Whisper + GPT-4o workflow
+
+The app runs from one entrypoint: `app.py`.
+
+`audora.py` is now a lightweight compatibility shim that loads `app.py`.
+
 ## 🔑 API Key
 
-Audora is designed around **one free key** from https://console.groq.com
+For Groq mode, use one free key from https://console.groq.com.
 
-- Used for both transcription and note generation
-- No OpenAI key required for the free flow in `audora.py`
+For OpenAI mode, use your paid OpenAI API key.
 
 ## 📖 Usage
 
@@ -71,40 +90,84 @@ Audora is designed around **one free key** from https://console.groq.com
 4. Click **Generate Notes**
 5. Review:
    - Clean Study Notes
+   - Confidence score, label, and reason for every note
    - Exam Radar hints
    - Raw transcript preview
-   - Downloads (`.md`, `.json`, transcript `.txt`)
+   - Downloads (`.md`, `.json` with confidence/source metadata, transcript `.txt`)
+
+### OCR for Scanned Syllabus PDFs
+
+Audora first tries embedded text extraction with PyPDF2. If the syllabus PDF looks scanned or yields very little text, it falls back to OCR page-by-page.
+
+To enable OCR support, install the Python packages:
+
+```bash
+pip install pypdfium2 pytesseract Pillow
+```
+
+On Windows, you also need the Tesseract runtime. A simple install path is:
+
+```powershell
+winget install UB-Mannheim.TesseractOCR
+```
+
+If OCR dependencies are missing, the app continues gracefully and shows a warning with install guidance.
+
+### Large Lecture Support
+
+- Files `<=25MB`: transcribed in a single request (same behavior as before).
+- Files `>25MB`: automatically split into safe chunks, transcribed sequentially with retry/backoff, then merged in order.
+- UI shows live progress for chunk prep, per-chunk transcription, and merge.
 
 ## 🧱 Architecture
 
 1. Syllabus extraction (`PyPDF2`) → chunking
-2. Local embeddings (`all-MiniLM-L6-v2`) → FAISS index
-3. Audio/video transcription via Groq Whisper
-4. Syllabus-context retrieval from local FAISS
-5. Structured note generation via Groq LLaMA
-6. Optional gTTS audio output
+2. Provider branch from sidebar toggle:
+   - Groq mode: local embeddings (`all-MiniLM-L6-v2`) + local FAISS
+   - OpenAI mode: OpenAI embeddings + FAISS via LangChain
+3. Audio/video transcription:
+   - Groq mode: Groq Whisper
+   - OpenAI mode: OpenAI Whisper
+4. Syllabus-context retrieval and grounding
+5. Structured note generation:
+   - Groq mode: Groq LLaMA 3.3 70B
+   - OpenAI mode: GPT-4o
+6. Deterministic confidence enrichment for each generated note
+7. Optional gTTS audio output
 
 ## 📦 Dependencies
 
 - `groq`
+- `openai`
+- `langchain`
+- `langchain-openai`
+- `langchain-community`
+- `langchain-text-splitters`
 - `sentence-transformers`
 - `faiss-cpu`
 - `numpy`
 - `PyPDF2`
+- `pypdfium2`
+- `pytesseract`
+- `Pillow`
 - `gTTS`
+- `pydub`
 - `streamlit`
 - `python-dotenv`
 
 ## ⚠️ Limits / Notes
 
-- Groq free transcription endpoint has request size limits (commonly 25MB per file in free tier).
-- `sentence-transformers` downloads the embedding model on first run.
+- Groq free transcription endpoint has request size limits (commonly 25MB per file in free tier). Audora now handles this by chunking large uploads automatically.
+- Large file chunking requires `pydub` and a working `ffmpeg` installation available on your system PATH.
+- `sentence-transformers` downloads the embedding model on first run (Groq mode).
 - TTS (`gTTS`) requires internet access.
+- OCR fallback requires `pypdfium2`, `pytesseract`, and `Pillow`, plus the Tesseract runtime on your machine.
+- On Windows, install Tesseract with `winget install UB-Mannheim.TesseractOCR` or add your existing install to `PATH`.
 
 ## 🔐 Privacy
 
-- Syllabus embedding + retrieval run locally.
-- Audio/video and transcript processing for AI steps is sent to Groq over HTTPS.
+- Groq mode: syllabus embedding + retrieval run locally, and AI steps are sent to Groq over HTTPS.
+- OpenAI mode: transcription and LLM calls are sent to OpenAI over HTTPS.
 - Keys are read from env/Streamlit input and not persisted by app logic.
 
 ## 📄 License
