@@ -90,6 +90,8 @@ For OpenAI mode, use your paid OpenAI API key.
 4. Click **Generate Notes**
 5. Review:
    - Clean Study Notes
+   - Source-linked note references with transcript timestamps and quote previews
+   - Syllabus coverage heatmap (Covered / Partial / Missing) with evidence snippets
    - Confidence score, label, and reason for every note
    - Exam Radar hints
    - Study Practice tabs:
@@ -97,6 +99,28 @@ For OpenAI mode, use your paid OpenAI API key.
      - Quiz Mode (MCQ + short answer + true/false, configurable length, optional timer, scoring + retry wrong)
    - Raw transcript preview
    - Downloads (`.md`, notes `.json`, transcript `.txt`, flashcards `.json`, quiz `.json`, revision set `.txt`)
+
+### Source-linked Notes
+
+- Audora transcribes lectures into timestamped segments (`segment_id`, `start_sec`, `end_sec`, `text`) and keeps a merged transcript string for downstream steps.
+- Note bullets include structured `references` where available.
+- If a model response omits references, Audora automatically aligns each bullet to the most similar transcript segment(s) and attaches fallback references.
+- In the UI, each note shows clickable timestamp chips and quote previews to verify evidence.
+- Clicking a source chip highlights the matched transcript segment and attempts to jump the lecture audio player.
+
+### Syllabus Coverage Heatmap
+
+- After note generation, Audora computes module-wise lecture coverage from syllabus modules/topics using semantic similarity against transcript evidence.
+- Each module reports:
+   - `coverage_percent` (0 to 100)
+   - `status`: Covered, Partial, or Missing
+   - `evidence_count`
+   - top evidence snippets
+- Thresholds:
+   - Covered: >= 70%
+   - Partial: 25% to 69%
+   - Missing: < 25%
+- Coverage summary is included in JSON export and rendered in the app as a heatmap-like table.
 
 ### OCR for Scanned Syllabus PDFs
 
@@ -137,6 +161,8 @@ If OCR dependencies are missing, the app continues gracefully and shows a warnin
    - OpenAI mode: GPT-4o
 6. Deterministic confidence enrichment for each generated note
 7. Optional gTTS audio output
+8. Source-reference attachment and fallback alignment
+9. Syllabus coverage scoring with module evidence
 
 ## 📦 Dependencies
 
@@ -166,6 +192,7 @@ If OCR dependencies are missing, the app continues gracefully and shows a warnin
 - TTS (`gTTS`) requires internet access.
 - OCR fallback requires `pypdfium2`, `pytesseract`, and `Pillow`, plus the Tesseract runtime on your machine.
 - On Windows, install Tesseract with `winget install UB-Mannheim.TesseractOCR` or add your existing install to `PATH`.
+- Audio timestamp seek support depends on browser/player capabilities. If direct seek is unavailable, Audora shows the exact timestamp for manual seeking.
 
 ## 🔐 Privacy
 

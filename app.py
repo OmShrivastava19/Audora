@@ -468,6 +468,51 @@ st.markdown(
   }
 
   .stProgress > div > div { background: var(--accent) !important; }
+
+    .source-meta {
+        font-size: 0.78rem;
+        color: var(--muted);
+        margin-top: 0.35rem;
+    }
+
+    .transcript-segment {
+        border: 1px solid var(--border);
+        border-radius: 10px;
+        padding: 0.55rem 0.75rem;
+        margin-bottom: 0.45rem;
+        background: rgba(255, 255, 255, 0.01);
+    }
+
+    .transcript-segment.active {
+        border-color: var(--accent);
+        background: rgba(79, 255, 176, 0.08);
+        box-shadow: 0 0 0 1px rgba(79, 255, 176, 0.16) inset;
+    }
+
+    .coverage-row {
+        display: grid;
+        grid-template-columns: 2.1fr 1fr 0.9fr 0.8fr;
+        gap: 0.6rem;
+        align-items: center;
+        padding: 0.5rem 0.65rem;
+        border-bottom: 1px solid var(--border);
+    }
+
+    .coverage-row:last-child { border-bottom: none; }
+
+    .coverage-meter {
+        height: 10px;
+        border-radius: 999px;
+        background: rgba(255,255,255,0.08);
+        overflow: hidden;
+        border: 1px solid var(--border);
+    }
+
+    .coverage-meter > span {
+        display: block;
+        height: 100%;
+        border-radius: 999px;
+    }
 </style>
 """,
     unsafe_allow_html=True,
@@ -490,7 +535,17 @@ Return ONLY JSON with keys:
 {
   "title": "...",
   "summary": "...",
-    "notes": [{"module": "...", "content": "...", "source_refs": []}],
+    "notes": [{
+        "module": "...",
+        "content": "...",
+        "references": [{
+            "segment_id": "seg_0001",
+            "start_sec": 0,
+            "end_sec": 12,
+            "quote": "short quote from transcript",
+            "confidence": 0.9
+        }]
+    }],
   "exam_radar": [{"hint": "...", "module": "...", "urgency": "HIGH|MEDIUM", "reason": "..."}],
   "filtered_count": 0,
   "language": "en"
@@ -596,6 +651,694 @@ STOPWORDS = {
     "you",
     "your",
 }
+
+
+def _safe_float(value, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except Exception:
+        return default
+
+
+def format_timestamp(seconds: float) -> str:
+    total = max(0, int(round(_safe_float(seconds, 0.0))))
+    mm = total // 60
+    ss = total % 60
+    return f"{mm:02d}:{ss:02d}"
+
+
+def normalize_transcript_segments(raw_segments) -> list[dict]:
+    """Normalize provider segment output into a consistent structure."""
+    normalized = []
+    if not isinstance(raw_segments, list):
+        return normalized
+
+    for idx, segment in enumerate(raw_segments, start=1):
+        if not isinstance(segment, dict):
+            continue
+        seg_id = str(segment.get("segment_id") or segment.get("id") or f"seg_{idx:04d}")
+        start_sec = _safe_float(segment.get("start_sec", segment.get("start", 0.0)), 0.0)
+        end_default = start_sec
+        text = str(segment.get("text", "") or "").strip()
+        if not text:
+            continue
+        end_sec = _safe_float(segment.get("end_sec", segment.get("end", end_default)), end_default)
+        if end_sec < start_sec:
+            end_sec = start_sec
+        normalized.append(
+            {
+                "segment_id": seg_id,
+                "start_sec": round(start_sec, 3),
+                "end_sec": round(end_sec, 3),
+                "text": text,
+            }
+        )
+
+    if not normalized:
+        return normalized
+
+    normalized.sort(key=lambda item: (item["start_sec"], item["end_sec"]))
+    for idx, segment in enumerate(normalized, start=1):
+        segment["segment_id"] = f"seg_{idx:04d}"
+    return normalized
+
+
+def merge_segments_to_text(transcript_segments: list[dict]) -> str:
+    """Merge ordered transcript segments to keep downstream behavior stable."""
+    if not transcript_segments:
+        return ""
+    return "\n".join(str(seg.get("text", "") or "").strip() for seg in transcript_segments if seg.get("text")).strip()
+
+
+def build_transcript_context_for_prompt(transcript_segments: list[dict], transcript_text: str, max_segments: int = 220) -> str:
+    """Build compact transcript context with segment identifiers for source citation."""
+    if transcript_segments:
+        parts = []
+        for seg in transcript_segments[:max_segments]:
+            seg_id = seg.get("segment_id", "seg_unknown")
+            start = format_timestamp(seg.get("start_sec", 0.0))
+            end = format_timestamp(seg.get("end_sec", seg.get("start_sec", 0.0)))
+            text = str(seg.get("text", "") or "").strip()
+            if not text:
+                continue
+            parts.append(f"[{seg_id} {start}-{end}] {text}")
+        if parts:
+            return "\n".join(parts)
+    return transcript_text or ""
+
+
+def _parse_transcription_response_to_segments(response_payload, response_text: str = "") -> list[dict]:
+    if isinstance(response_payload, dict):
+        segments = response_payload.get("segments")
+        if isinstance(segments, list) and segments:
+            return normalize_transcript_segments(segments)
+        text = str(response_payload.get("text", "") or "").strip()
+        if text:
+            return normalize_transcript_segments([{"id": "seg_0001", "start": 0, "end": 0, "text": text}])
+
+    text_fallback = (response_text or "").strip()
+    if text_fallback:
+        return normalize_transcript_segments([{"id": "seg_0001", "start": 0, "end": 0, "text": text_fallback}])
+    return []
+
+
+def _transcribe_file_with_groq_timestamps(file_path: str, filename: str, groq_key: str) -> list[dict]:
+    suffix = _validate_audio_extension(filename)
+    if not GROQ_OK:
+        raise RuntimeError("groq package not installed. Run: pip install groq")
+    if not groq_key:
+        raise ValueError("Groq API key missing.")
+
+    client = Groq(api_key=groq_key)
+    with open(file_path, "rb") as audio_file:
+        audio_bytes = audio_file.read()
+
+    response = client.audio.transcriptions.create(
+        model="whisper-large-v3-turbo",
+        file=(filename, audio_bytes, CONTENT_TYPES.get(suffix, "audio/mpeg")),
+        response_format="verbose_json",
+    )
+    payload = response.model_dump() if hasattr(response, "model_dump") else response
+    return _parse_transcription_response_to_segments(payload, str(response))
+
+
+def _transcribe_file_with_openai_timestamps(file_path: str, api_key: str) -> list[dict]:
+    if not OPENAI_OK:
+        raise RuntimeError("openai package not installed. Run: pip install openai")
+    if not api_key:
+        raise ValueError("OpenAI API key missing.")
+
+    client = openai.OpenAI(api_key=api_key)
+    with open(file_path, "rb") as audio_file:
+        response = client.audio.transcriptions.create(
+            model="whisper-1",
+            file=audio_file,
+            response_format="verbose_json",
+            timestamp_granularities=["segment"],
+        )
+    payload = response.model_dump() if hasattr(response, "model_dump") else response
+    return _parse_transcription_response_to_segments(payload, str(response))
+
+
+def _audio_duration_seconds(file_path: str) -> float:
+    if not PYDUB_OK:
+        return 0.0
+    try:
+        audio = AudioSegment.from_file(file_path)
+        return max(0.0, len(audio) / 1000.0)
+    except Exception:
+        return 0.0
+
+
+def transcribe_with_timestamps(audio_bytes, filename, provider, api_key, progress_callback=None) -> dict:
+    """Transcribe to timestamped segments while preserving merged transcript text."""
+    suffix = _validate_audio_extension(filename)
+    size_mb = len(audio_bytes) / (1024 * 1024)
+    all_segments: list[dict] = []
+
+    if size_mb <= 25:
+        tmp_path = None
+        try:
+            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+                tmp.write(audio_bytes)
+                tmp_path = tmp.name
+
+            if provider == "groq":
+                all_segments = _run_with_retries(lambda: _transcribe_file_with_groq_timestamps(tmp_path, filename, api_key))
+            elif provider == "openai":
+                all_segments = _run_with_retries(lambda: _transcribe_file_with_openai_timestamps(tmp_path, api_key))
+            else:
+                raise ValueError(f"Unsupported provider: {provider}")
+        finally:
+            _cleanup_temp_paths([tmp_path] if tmp_path else [])
+
+        transcript_segments = normalize_transcript_segments(all_segments)
+        transcript_text = merge_segments_to_text(transcript_segments)
+        return {"transcript_segments": transcript_segments, "transcript_text": transcript_text}
+
+    if progress_callback:
+        progress_callback("preparing")
+
+    chunk_paths: list[str] = []
+    try:
+        chunk_paths, _ = chunk_audio(audio_bytes, filename, target_chunk_mb=20.0)
+        total_chunks = len(chunk_paths)
+        cumulative_offset = 0.0
+
+        for idx, chunk_path in enumerate(chunk_paths, start=1):
+            if progress_callback:
+                progress_callback("chunk", idx, total_chunks)
+
+            chunk_filename = f"{Path(filename).stem}_chunk_{idx}{suffix}"
+            if provider == "groq":
+                chunk_segments = _run_with_retries(lambda: _transcribe_file_with_groq_timestamps(chunk_path, chunk_filename, api_key))
+            elif provider == "openai":
+                chunk_segments = _run_with_retries(lambda: _transcribe_file_with_openai_timestamps(chunk_path, api_key))
+            else:
+                raise ValueError(f"Unsupported provider: {provider}")
+
+            for seg in normalize_transcript_segments(chunk_segments):
+                all_segments.append(
+                    {
+                        "segment_id": seg["segment_id"],
+                        "start_sec": round(seg["start_sec"] + cumulative_offset, 3),
+                        "end_sec": round(seg["end_sec"] + cumulative_offset, 3),
+                        "text": seg["text"],
+                    }
+                )
+
+            cumulative_offset += _audio_duration_seconds(chunk_path)
+
+        if progress_callback:
+            progress_callback("merging")
+
+        transcript_segments = normalize_transcript_segments(all_segments)
+        transcript_text = merge_segments_to_text(transcript_segments)
+        if not transcript_text:
+            raise RuntimeError("Transcription completed but segment output was empty.")
+        return {"transcript_segments": transcript_segments, "transcript_text": transcript_text}
+    finally:
+        _cleanup_temp_paths(chunk_paths)
+
+
+def _similarity_scores(note_text: str, transcript_segments: list[dict]) -> list[tuple[int, float]]:
+    if not transcript_segments:
+        return []
+
+    segment_texts = [str(seg.get("text", "") or "") for seg in transcript_segments]
+
+    if SBERT_OK and SentenceTransformer is not None and np is not None:
+        model = load_embedding_model()
+        if model is not None:
+            note_vec = model.encode([note_text], convert_to_numpy=True).astype("float32")
+            seg_vecs = model.encode(segment_texts, batch_size=32, show_progress_bar=False, convert_to_numpy=True).astype("float32")
+            note_norm = np.linalg.norm(note_vec, axis=1, keepdims=True)
+            seg_norm = np.linalg.norm(seg_vecs, axis=1, keepdims=True)
+            note_vec = note_vec / np.clip(note_norm, 1e-8, None)
+            seg_vecs = seg_vecs / np.clip(seg_norm, 1e-8, None)
+            sims = (seg_vecs @ note_vec.T).reshape(-1)
+            return [(idx, float(score)) for idx, score in enumerate(sims)]
+
+    note_terms = _normalize_terms(note_text)
+    scores = []
+    for idx, seg in enumerate(transcript_segments):
+        seg_terms = _normalize_terms(str(seg.get("text", "") or ""))
+        if not note_terms or not seg_terms:
+            score = 0.0
+        else:
+            overlap = len(note_terms & seg_terms)
+            score = overlap / max(1, len(note_terms))
+        scores.append((idx, float(score)))
+    return scores
+
+
+def _normalize_reference_item(reference: dict, transcript_index: dict) -> dict | None:
+    if not isinstance(reference, dict):
+        return None
+    segment_id = str(reference.get("segment_id", "") or "").strip()
+    start_sec = reference.get("start_sec")
+    end_sec = reference.get("end_sec")
+    quote = str(reference.get("quote", "") or "").strip()
+    confidence = reference.get("confidence")
+
+    if segment_id and segment_id in transcript_index:
+        seg = transcript_index[segment_id]
+        if start_sec is None:
+            start_sec = seg.get("start_sec", 0)
+        if end_sec is None:
+            end_sec = seg.get("end_sec", start_sec)
+        if not quote:
+            quote = str(seg.get("text", "") or "")[:180]
+    elif segment_id and segment_id not in transcript_index:
+        segment_id = ""
+
+    if start_sec is None:
+        start_sec = 0.0
+    if end_sec is None:
+        end_sec = start_sec
+
+    normalized = {
+        "segment_id": segment_id or "unknown",
+        "start_sec": round(_safe_float(start_sec, 0.0), 3),
+        "end_sec": round(_safe_float(end_sec, _safe_float(start_sec, 0.0)), 3),
+        "quote": quote[:220],
+    }
+    if confidence is not None:
+        try:
+            normalized["confidence"] = round(float(confidence), 3)
+        except Exception:
+            pass
+    return normalized
+
+
+def _fallback_references_for_note(note_content: str, transcript_segments: list[dict], max_refs: int = 3) -> list[dict]:
+    if not note_content or not transcript_segments:
+        return []
+    scores = _similarity_scores(note_content, transcript_segments)
+    ranked = sorted(scores, key=lambda item: item[1], reverse=True)
+    top = ranked[: max(1, min(max_refs, 3))]
+    references = []
+    for idx, score in top:
+        if score <= 0:
+            continue
+        seg = transcript_segments[idx]
+        references.append(
+            {
+                "segment_id": seg.get("segment_id", f"seg_{idx+1:04d}"),
+                "start_sec": seg.get("start_sec", 0.0),
+                "end_sec": seg.get("end_sec", 0.0),
+                "quote": str(seg.get("text", "") or "")[:220],
+                "confidence": round(float(score), 3),
+            }
+        )
+    return references
+
+
+def _legacy_source_refs_from_references(references: list[dict]) -> list[str]:
+    refs = []
+    for ref in references:
+        start = format_timestamp(ref.get("start_sec", 0.0))
+        end = format_timestamp(ref.get("end_sec", ref.get("start_sec", 0.0)))
+        seg_id = str(ref.get("segment_id", "")).strip()
+        refs.append(f"{start}-{end} ({seg_id})")
+    return refs
+
+
+def attach_source_references_to_notes(result: dict, transcript_segments: list[dict]) -> dict:
+    """Attach structured transcript references; align by similarity when model output omits them."""
+    enriched = dict(result or {})
+    notes = enriched.get("notes", [])
+    if not isinstance(notes, list):
+        notes = []
+
+    transcript_index = {
+        str(seg.get("segment_id", "")): seg
+        for seg in transcript_segments
+        if isinstance(seg, dict) and seg.get("segment_id")
+    }
+
+    normalized_notes = []
+    for note in notes:
+        if not isinstance(note, dict):
+            note = {"module": "General", "content": str(note)}
+
+        content = str(note.get("content", "") or "")
+        references = note.get("references")
+        if not isinstance(references, list):
+            references = []
+
+        normalized_refs = []
+        for ref in references:
+            normalized_ref = _normalize_reference_item(ref, transcript_index)
+            if normalized_ref:
+                normalized_refs.append(normalized_ref)
+
+        if not normalized_refs:
+            normalized_refs = _fallback_references_for_note(content, transcript_segments, max_refs=3)
+
+        normalized_note = dict(note)
+        normalized_note["references"] = normalized_refs
+        normalized_note["source_refs"] = _legacy_source_refs_from_references(normalized_refs)
+        normalized_notes.append(normalized_note)
+
+    enriched["notes"] = normalized_notes
+    return enriched
+
+
+def _parse_syllabus_modules(syllabus_text: str) -> list[dict]:
+    if not (syllabus_text or "").strip():
+        return []
+
+    lines = [line.strip() for line in syllabus_text.splitlines() if line.strip()]
+    heading_pattern = re.compile(
+        r"^(module|unit|chapter|week)\s*([0-9ivxIVX]+)?\s*[:.\-)\]]?\s*(.*)$",
+        re.IGNORECASE,
+    )
+    numbered_pattern = re.compile(r"^([0-9]{1,2})[.)-]\s+(.+)$")
+
+    modules = []
+    current = None
+    for line in lines:
+        heading_match = heading_pattern.match(line)
+        numbered_match = numbered_pattern.match(line)
+
+        if heading_match:
+            module_name = line
+            if current:
+                modules.append(current)
+            current = {"module_name": module_name[:140], "content": ""}
+            continue
+
+        if numbered_match and len(line.split()) <= 10:
+            module_name = f"Module {numbered_match.group(1)}: {numbered_match.group(2)}"
+            if current:
+                modules.append(current)
+            current = {"module_name": module_name[:140], "content": ""}
+            continue
+
+        if current is None:
+            current = {"module_name": "Module 1", "content": ""}
+        current["content"] = (current["content"] + " " + line).strip()
+
+    if current:
+        modules.append(current)
+
+    compact_modules = []
+    for idx, module in enumerate(modules, start=1):
+        module_name = str(module.get("module_name", f"Module {idx}") or f"Module {idx}").strip()
+        content = str(module.get("content", "") or "").strip()
+        if not content:
+            content = module_name
+        compact_modules.append({"module_name": module_name, "content": content})
+
+    if compact_modules:
+        return compact_modules
+
+    chunks = chunk_text(syllabus_text, chunk_size=700, overlap=120)
+    return [{"module_name": f"Module {idx}", "content": chunk} for idx, chunk in enumerate(chunks, start=1)]
+
+
+def _status_from_percent(coverage_percent: float) -> str:
+    if coverage_percent >= 70:
+        return "Covered"
+    if coverage_percent >= 25:
+        return "Partial"
+    return "Missing"
+
+
+def compute_syllabus_coverage(syllabus_text: str, transcript_segments: list[dict], transcript_text: str) -> dict:
+    """Compute module-wise coverage with semantic similarity and snippet evidence."""
+    modules = _parse_syllabus_modules(syllabus_text)
+    if not modules:
+        return {"modules": [], "summary": {"covered": 0, "partial": 0, "missing": 0, "total": 0}, "error": "No syllabus text available."}
+
+    evidence_segments = transcript_segments if transcript_segments else normalize_transcript_segments(
+        [
+            {"segment_id": f"seg_{idx:04d}", "start_sec": 0.0, "end_sec": 0.0, "text": chunk}
+            for idx, chunk in enumerate(chunk_text(transcript_text or "", chunk_size=360, overlap=60), start=1)
+        ]
+    )
+    if not evidence_segments:
+        return {"modules": [], "summary": {"covered": 0, "partial": 0, "missing": 0, "total": len(modules)}, "error": "No transcript evidence available."}
+
+    module_vectors = []
+    evidence_vectors = []
+    use_embedding = SBERT_OK and SentenceTransformer is not None and np is not None
+    if use_embedding:
+        model = load_embedding_model()
+        if model is not None:
+            module_vectors = model.encode([m["content"] for m in modules], convert_to_numpy=True).astype("float32")
+            evidence_vectors = model.encode([e["text"] for e in evidence_segments], batch_size=32, show_progress_bar=False, convert_to_numpy=True).astype("float32")
+            module_vectors = module_vectors / np.clip(np.linalg.norm(module_vectors, axis=1, keepdims=True), 1e-8, None)
+            evidence_vectors = evidence_vectors / np.clip(np.linalg.norm(evidence_vectors, axis=1, keepdims=True), 1e-8, None)
+        else:
+            use_embedding = False
+
+    module_rows = []
+    for idx, module in enumerate(modules):
+        module_name = module["module_name"]
+        if use_embedding:
+            sims = evidence_vectors @ module_vectors[idx].reshape(-1, 1)
+            sims = sims.reshape(-1)
+            scored = [(seg_idx, float(score)) for seg_idx, score in enumerate(sims)]
+        else:
+            module_terms = _normalize_terms(module["content"])
+            scored = []
+            for seg_idx, seg in enumerate(evidence_segments):
+                seg_terms = _normalize_terms(seg.get("text", ""))
+                if not module_terms or not seg_terms:
+                    sim = 0.0
+                else:
+                    sim = len(module_terms & seg_terms) / max(1, len(module_terms))
+                scored.append((seg_idx, float(sim)))
+
+        ranked = sorted(scored, key=lambda item: item[1], reverse=True)
+        top_ranked = ranked[:5]
+        top_values = [score for _, score in top_ranked if score > 0]
+        coverage_percent = round((sum(top_values) / max(1, len(top_values))) * 100, 1) if top_values else 0.0
+        status = _status_from_percent(coverage_percent)
+        evidence_count = sum(1 for _, score in ranked if score >= 0.35)
+
+        snippets = []
+        for seg_idx, score in top_ranked[:3]:
+            if score <= 0:
+                continue
+            seg = evidence_segments[seg_idx]
+            snippets.append(
+                {
+                    "segment_id": seg.get("segment_id", f"seg_{seg_idx+1:04d}"),
+                    "start_sec": seg.get("start_sec", 0.0),
+                    "end_sec": seg.get("end_sec", 0.0),
+                    "text": str(seg.get("text", "") or "")[:220],
+                    "score": round(float(score), 3),
+                }
+            )
+
+        module_rows.append(
+            {
+                "module_name": module_name,
+                "coverage_percent": coverage_percent,
+                "status": status,
+                "evidence_count": evidence_count,
+                "top_evidence_snippets": snippets,
+            }
+        )
+
+    covered = sum(1 for row in module_rows if row["status"] == "Covered")
+    partial = sum(1 for row in module_rows if row["status"] == "Partial")
+    missing = sum(1 for row in module_rows if row["status"] == "Missing")
+
+    return {
+        "modules": module_rows,
+        "summary": {
+            "covered": covered,
+            "partial": partial,
+            "missing": missing,
+            "total": len(module_rows),
+        },
+    }
+
+
+def _coverage_fill_color(coverage_percent: float) -> str:
+    pct = max(0.0, min(100.0, float(coverage_percent)))
+    if pct >= 70:
+        return "linear-gradient(90deg, rgba(79,255,176,0.95), rgba(79,255,176,0.55))"
+    if pct >= 25:
+        return "linear-gradient(90deg, rgba(255,209,102,0.95), rgba(255,209,102,0.55))"
+    return "linear-gradient(90deg, rgba(255,107,107,0.95), rgba(255,107,107,0.55))"
+
+
+def render_coverage_heatmap(coverage_payload: dict):
+    """Render module-wise coverage with color intensity and drill-down evidence."""
+    if not isinstance(coverage_payload, dict):
+        st.info("Coverage heatmap unavailable for this lecture.")
+        return
+
+    modules = coverage_payload.get("modules", [])
+    summary = coverage_payload.get("summary", {})
+    error = coverage_payload.get("error")
+
+    if error:
+        st.info(f"Coverage could not be computed: {error}")
+        return
+    if not modules:
+        st.info("No syllabus modules were detected to score coverage.")
+        return
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Covered", int(summary.get("covered", 0)))
+    c2.metric("Partial", int(summary.get("partial", 0)))
+    c3.metric("Missing", int(summary.get("missing", 0)))
+
+    st.markdown(
+        "<div class='card'>"
+        "<div class='coverage-row' style='font-family:DM Mono,monospace;color:#7b82a0;'>"
+        "<div>Module</div><div>Coverage</div><div>Status</div><div>Evidence</div>"
+        "</div>",
+        unsafe_allow_html=True,
+    )
+
+    for idx, row in enumerate(modules, start=1):
+        module_name = html.escape(str(row.get("module_name", f"Module {idx}")))
+        coverage_percent = float(row.get("coverage_percent", 0.0) or 0.0)
+        status = html.escape(str(row.get("status", "Missing")))
+        evidence_count = int(row.get("evidence_count", 0) or 0)
+        meter_fill = _coverage_fill_color(coverage_percent)
+
+        st.markdown(
+            "<div class='coverage-row'>"
+            f"<div>{module_name}</div>"
+            f"<div><div class='coverage-meter'><span style='width:{coverage_percent:.1f}%;background:{meter_fill};'></span></div><div class='source-meta'>{coverage_percent:.1f}%</div></div>"
+            f"<div>{status}</div>"
+            f"<div>{evidence_count}</div>"
+            "</div>",
+            unsafe_allow_html=True,
+        )
+
+        snippets = row.get("top_evidence_snippets", [])
+        with st.expander(f"Evidence for {module_name}", expanded=False):
+            if not snippets:
+                st.caption("No strong transcript evidence found for this module.")
+            else:
+                for snip in snippets:
+                    start = format_timestamp(snip.get("start_sec", 0.0))
+                    end = format_timestamp(snip.get("end_sec", snip.get("start_sec", 0.0)))
+                    score = float(snip.get("score", 0.0) or 0.0)
+                    st.markdown(f"**{start} to {end}** · similarity {score:.2f}")
+                    st.caption(str(snip.get("text", "")))
+
+    st.markdown("</div>", unsafe_allow_html=True)
+
+
+def render_source_linked_notes(notes: list[dict], transcript_segments: list[dict]):
+    """Render notes with clickable source references and transcript highlight state."""
+    if not notes:
+        st.info("No structured notes were returned.")
+        return
+
+    segment_lookup = {seg.get("segment_id"): seg for seg in transcript_segments if isinstance(seg, dict)}
+
+    for note_idx, note in enumerate(notes):
+        module = str(note.get("module", "General") or "General")
+        content = str(note.get("content", "") or "")
+        confidence_label = str(note.get("confidence_label", "LOW")).upper()
+        confidence_score = float(note.get("confidence_score", 0.0) or 0.0)
+        confidence_reason = str(note.get("confidence_reason", "") or "")
+        references = note.get("references", []) if isinstance(note.get("references", []), list) else []
+
+        confidence_class = "confidence-high" if confidence_label == "HIGH" else "confidence-med" if confidence_label == "MEDIUM" else "confidence-low"
+        st.markdown(
+            f"<div class='card'>"
+            f"<div class='section-label'>{html.escape(module)}</div>"
+            f"<div class='confidence-row'>"
+            f"<span class='rbadge {confidence_class}'>Confidence {html.escape(confidence_label)}</span>"
+            f"<span class='rbadge rbadge-mod'>{confidence_score:.2f}</span>"
+            f"</div>"
+            f"<div class='notes-body'>{content}</div>"
+            f"<p class='confidence-reason'>{html.escape(confidence_reason)}</p>"
+            f"</div>",
+            unsafe_allow_html=True,
+        )
+
+        if not references:
+            st.caption("No source references available for this note.")
+            continue
+
+        st.caption("Sources")
+        for ref_idx, ref in enumerate(references, start=1):
+            seg_id = str(ref.get("segment_id", "unknown") or "unknown")
+            start_sec = float(ref.get("start_sec", 0.0) or 0.0)
+            end_sec = float(ref.get("end_sec", start_sec) or start_sec)
+            quote = str(ref.get("quote", "") or "").strip()
+            confidence = ref.get("confidence")
+
+            time_label = f"{format_timestamp(start_sec)} to {format_timestamp(end_sec)}"
+            btn_label = f"{time_label}"
+            if st.button(btn_label, key=f"source_ref_{note_idx}_{ref_idx}_{seg_id}"):
+                st.session_state["selected_segment_id"] = seg_id
+                st.session_state["selected_seek_sec"] = start_sec
+                st.session_state["transcript_focus_requested"] = True
+
+            conf_txt = ""
+            if confidence is not None:
+                try:
+                    conf_txt = f" · confidence {_safe_float(confidence, 0.0):.2f}"
+                except Exception:
+                    conf_txt = ""
+            st.markdown(f"<div class='source-meta'>{html.escape(seg_id)}{conf_txt}</div>", unsafe_allow_html=True)
+            if quote:
+                st.caption(quote)
+            elif seg_id in segment_lookup:
+                st.caption(str(segment_lookup[seg_id].get("text", ""))[:220])
+
+
+def render_transcript_panel(transcript_segments: list[dict], transcript_text: str, lecture_audio_bytes: bytes, lecture_audio_mime: str):
+    """Render transcript with segment-level highlight and best-effort audio jump."""
+    selected_seg = st.session_state.get("selected_segment_id")
+    selected_seek_sec = float(st.session_state.get("selected_seek_sec", 0.0) or 0.0)
+
+    if lecture_audio_bytes:
+        st.markdown("#### Lecture Audio")
+        st.caption("Use source chips in notes to jump to referenced timestamps.")
+        seek_supported = True
+        try:
+            st.audio(lecture_audio_bytes, format=lecture_audio_mime, start_time=int(selected_seek_sec))
+        except TypeError:
+            seek_supported = False
+            st.audio(lecture_audio_bytes, format=lecture_audio_mime)
+
+        if selected_seg:
+            if seek_supported:
+                st.caption(f"Jumped to {format_timestamp(selected_seek_sec)} from segment {selected_seg}.")
+            else:
+                st.warning(
+                    f"Direct seek is not supported in this browser session. Manually seek to {format_timestamp(selected_seek_sec)}."
+                )
+
+    expanded = bool(st.session_state.get("transcript_focus_requested", False))
+    with st.expander("Transcript (segment view)", expanded=expanded):
+        if transcript_segments:
+            for seg in transcript_segments[:600]:
+                seg_id = str(seg.get("segment_id", ""))
+                start = format_timestamp(seg.get("start_sec", 0.0))
+                end = format_timestamp(seg.get("end_sec", seg.get("start_sec", 0.0)))
+                seg_text = html.escape(str(seg.get("text", "") or ""))
+                active_class = " active" if selected_seg and selected_seg == seg_id else ""
+                st.markdown(
+                    f"<div class='transcript-segment{active_class}'>"
+                    f"<div class='source-meta'><strong>{html.escape(seg_id)}</strong> · {start} to {end}</div>"
+                    f"<div style='margin-top:0.2rem'>{seg_text}</div>"
+                    f"</div>",
+                    unsafe_allow_html=True,
+                )
+        else:
+            preview = transcript_text[:4000] + ("..." if len(transcript_text) > 4000 else "")
+            st.markdown(
+                f"<div style='font-family:DM Mono,monospace;font-size:0.78rem;color:#7b82a0;line-height:1.7;white-space:pre-wrap;'>{html.escape(preview)}</div>",
+                unsafe_allow_html=True,
+            )
+
+    st.session_state["transcript_focus_requested"] = False
 
 
 def get_env_key(name: str) -> str:
@@ -946,7 +1689,7 @@ def _extract_json(raw: str) -> dict:
         return {
             "title": "Lecture Notes",
             "summary": "Notes extracted from lecture transcript.",
-            "notes": [{"module": "General", "content": raw, "source_refs": []}],
+            "notes": [{"module": "General", "content": raw, "references": [], "source_refs": []}],
             "exam_radar": [],
             "filtered_count": 0,
             "language": "en",
@@ -1095,6 +1838,9 @@ def enrich_notes_with_confidence(result, transcript, syllabus_context) -> dict:
 
         module = str(note.get("module", "General") or "General")
         content = str(note.get("content", "") or "")
+        references = note.get("references", [])
+        if not isinstance(references, list):
+            references = []
         source_refs = note.get("source_refs", [])
         if not isinstance(source_refs, list):
             source_refs = []
@@ -1112,6 +1858,7 @@ def enrich_notes_with_confidence(result, transcript, syllabus_context) -> dict:
         normalized_note = dict(note)
         normalized_note["module"] = module
         normalized_note["content"] = content
+        normalized_note["references"] = references
         normalized_note["source_refs"] = source_refs
         normalized_note["confidence_score"] = score
         normalized_note["confidence_label"] = label
@@ -1122,7 +1869,7 @@ def enrich_notes_with_confidence(result, transcript, syllabus_context) -> dict:
     return enriched
 
 
-def generate_notes_with_groq(transcript: str, syllabus_context: str, groq_key: str, target_language: str) -> dict:
+def generate_notes_with_groq(transcript_context: str, syllabus_context: str, groq_key: str, target_language: str) -> dict:
     if not GROQ_OK:
         raise RuntimeError("groq package not installed. Run: pip install groq")
 
@@ -1137,11 +1884,12 @@ def generate_notes_with_groq(transcript: str, syllabus_context: str, groq_key: s
 SYLLABUS CONTEXT
 {syllabus_context if syllabus_context else "[No syllabus uploaded]"}
 
-RAW TRANSCRIPT
-{transcript}
+RAW TRANSCRIPT WITH SEGMENT IDS
+{transcript_context}
 
 FINAL INSTRUCTION
 {language_line}
+Ensure each note item includes a references array with segment_id, start_sec, end_sec, quote, and optional confidence.
 Apply all directives and return only the JSON object.
 """
 
@@ -1155,7 +1903,7 @@ Apply all directives and return only the JSON object.
     return _extract_json(response.choices[0].message.content.strip())
 
 
-def generate_notes_with_openai(transcript: str, syllabus_context: str, api_key: str, target_language: str) -> dict:
+def generate_notes_with_openai(transcript_context: str, syllabus_context: str, api_key: str, target_language: str) -> dict:
     language_line = (
         f"Write ALL notes and summary in {target_language}. Keep technical terms in English with translations in parentheses."
         if target_language.lower() != "english"
@@ -1166,11 +1914,12 @@ def generate_notes_with_openai(transcript: str, syllabus_context: str, api_key: 
 SYLLABUS CONTEXT
 {syllabus_context if syllabus_context else "[No syllabus uploaded]"}
 
-RAW TRANSCRIPT
-{transcript}
+RAW TRANSCRIPT WITH SEGMENT IDS
+{transcript_context}
 
 FINAL INSTRUCTION
 {language_line}
+Ensure each note item includes a references array with segment_id, start_sec, end_sec, quote, and optional confidence.
 Apply all directives and return only the JSON object.
 """.strip()
 
@@ -2152,10 +2901,13 @@ elif not audio_file:
 if run_button and can_run:
     result = {}
     transcript = ""
+    transcript_segments = []
+    structured_result = {}
     practice_payload = None
     progress = st.progress(0, text="Starting pipeline...")
 
     vector_store = None
+    syllabus_text = ""
     if syllabus_file:
         progress.progress(10, text="Processing syllabus...")
         try:
@@ -2193,17 +2945,22 @@ if run_button and can_run:
             elif stage == "merging":
                 progress.progress(59, text="Merging transcripts...")
 
-        transcript = transcribe_audio_orchestrator(
+        transcription_payload = transcribe_with_timestamps(
             audio_bytes=audio_bytes,
             filename=audio_file.name,
             provider=provider,
             api_key=api_key,
             progress_callback=on_transcription_progress,
         )
+        transcript_segments = transcription_payload.get("transcript_segments", [])
+        transcript = transcription_payload.get("transcript_text", "")
 
         if not transcript:
             st.error("Transcription returned empty output.")
             st.stop()
+
+        if not transcript_segments:
+            st.warning("Timestamped segments were not available. Notes will still be generated without source jumps.")
     except Exception as e:
         st.error(f"Transcription failed: {e}")
         with st.expander("Debug details"):
@@ -2215,16 +2972,40 @@ if run_button and can_run:
 
     progress.progress(78, text="Generating structured notes...")
     try:
+        transcript_context = build_transcript_context_for_prompt(transcript_segments, transcript)
         if provider == "groq":
-            result = generate_notes_with_groq(transcript, syllabus_context, api_key, selected_language)
+            result = generate_notes_with_groq(transcript_context, syllabus_context, api_key, selected_language)
         else:
-            result = generate_notes_with_openai(transcript, syllabus_context, api_key, selected_language)
+            result = generate_notes_with_openai(transcript_context, syllabus_context, api_key, selected_language)
+        result = attach_source_references_to_notes(result, transcript_segments)
         result = enrich_notes_with_confidence(result, transcript, syllabus_context)
     except Exception as e:
         st.error(f"Note generation failed: {e}")
         with st.expander("Debug details"):
             st.code(traceback.format_exc())
         st.stop()
+
+    progress.progress(83, text="Computing syllabus coverage...")
+    try:
+        syllabus_coverage = compute_syllabus_coverage(syllabus_text, transcript_segments, transcript)
+    except Exception as e:
+        syllabus_coverage = {
+            "modules": [],
+            "summary": {"covered": 0, "partial": 0, "missing": 0, "total": 0},
+            "error": f"Coverage computation failed: {e}",
+        }
+
+    structured_result = {
+        "title": result.get("title", "Lecture Notes"),
+        "summary": result.get("summary", ""),
+        "filtered_count": result.get("filtered_count", 0),
+        "language": result.get("language", "en"),
+        "notes": result.get("notes", []),
+        "exam_radar": result.get("exam_radar", []),
+        "transcript_segments": transcript_segments,
+        "transcript_text": transcript,
+        "syllabus_coverage": syllabus_coverage,
+    }
 
     progress.progress(86, text="Generating study practice...")
     try:
@@ -2241,22 +3022,29 @@ if run_button and can_run:
 
     progress.progress(100, text="Done")
 
-    st.session_state["audora_result"] = result
+    st.session_state["audora_result"] = structured_result
+    st.session_state["audora_pipeline_result"] = structured_result
     st.session_state["audora_transcript"] = transcript
     st.session_state["audora_audio_out"] = audio_out
     st.session_state["audora_provider"] = provider
     st.session_state["audora_language"] = selected_language
+    st.session_state["audora_lecture_audio_bytes"] = audio_bytes
+    st.session_state["audora_lecture_audio_mime"] = CONTENT_TYPES.get(Path(audio_file.name).suffix.lower(), "audio/mpeg")
 
-    practice_key = _notes_fingerprint(result)
+    practice_key = _notes_fingerprint(structured_result)
     st.session_state["practice_payload"] = practice_payload
     st.session_state["practice_payload_key"] = practice_key
     init_practice_state(practice_payload, practice_key)
 
-generated_result = st.session_state.get("audora_result")
+generated_result = st.session_state.get("audora_pipeline_result") or st.session_state.get("audora_result")
 if generated_result:
     result = generated_result
-    transcript = st.session_state.get("audora_transcript", "")
+    transcript = st.session_state.get("audora_transcript", result.get("transcript_text", ""))
+    transcript_segments = result.get("transcript_segments", []) if isinstance(result.get("transcript_segments", []), list) else []
+    syllabus_coverage = result.get("syllabus_coverage", {})
     audio_out = st.session_state.get("audora_audio_out", b"")
+    lecture_audio_bytes = st.session_state.get("audora_lecture_audio_bytes", b"")
+    lecture_audio_mime = st.session_state.get("audora_lecture_audio_mime", "audio/mpeg")
     provider_used = st.session_state.get("audora_provider", provider)
     language_used = st.session_state.get("audora_language", selected_language)
 
@@ -2306,37 +3094,11 @@ if generated_result:
 
     with notes_col:
         st.markdown('<div class="section-label">Clean Study Notes</div>', unsafe_allow_html=True)
-        if notes:
-            for note in notes:
-                module = note.get("module", "General")
-                content = note.get("content", "")
-                confidence_label = str(note.get("confidence_label", "LOW")).upper()
-                confidence_score = float(note.get("confidence_score", 0.0) or 0.0)
-                confidence_reason = note.get("confidence_reason", "")
-                source_refs = note.get("source_refs", [])
-                confidence_class = "confidence-high" if confidence_label == "HIGH" else "confidence-med" if confidence_label == "MEDIUM" else "confidence-low"
-                source_ref_text = ", ".join(str(ref) for ref in source_refs) if source_refs else ""
-                source_refs_html = (
-                    f"<p class='confidence-reason'>Source refs: {html.escape(source_ref_text)}</p>" if source_ref_text else ""
-                )
-                card_html = (
-                    f"<div class='card'>"
-                    f"<div class='section-label'>{html.escape(str(module))}</div>"
-                    f"<div class='confidence-row'>"
-                    f"<span class='rbadge {confidence_class}'>Confidence {html.escape(confidence_label)}</span>"
-                    f"<span class='rbadge rbadge-mod'>{confidence_score:.2f}</span>"
-                    f"</div>"
-                    f"<div class='notes-body'>{content}</div>"
-                    f"<p class='confidence-reason'>{html.escape(confidence_reason)}</p>"
-                    f"{source_refs_html}"
-                    f"</div>"
-                )
-                st.markdown(
-                    card_html,
-                    unsafe_allow_html=True,
-                )
-        else:
-            st.info("No structured notes were returned.")
+        render_source_linked_notes(notes, transcript_segments)
+
+        st.divider()
+        st.markdown('<div class="section-label">Syllabus Coverage Heatmap</div>', unsafe_allow_html=True)
+        render_coverage_heatmap(syllabus_coverage)
 
         if audio_out:
             st.divider()
@@ -2371,12 +3133,7 @@ if generated_result:
             )
 
         st.divider()
-        with st.expander("Raw Transcript", expanded=False):
-            preview = transcript[:3000] + ("..." if len(transcript) > 3000 else "")
-            st.markdown(
-                f"<div style='font-family:DM Mono,monospace;font-size:0.78rem;color:#7b82a0;line-height:1.7;white-space:pre-wrap;'>{preview}</div>",
-                unsafe_allow_html=True,
-            )
+        render_transcript_panel(transcript_segments, transcript, lecture_audio_bytes, lecture_audio_mime)
 
     st.divider()
     st.markdown('<div class="section-label">Study Practice</div>', unsafe_allow_html=True)
@@ -2396,6 +3153,7 @@ if generated_result:
     revision_lines = [f"{idx}. Q: {card.get('question', '')}\nA: {card.get('answer', '')}" for idx, card in enumerate(practice_payload.get("flashcards", []), start=1)]
     revision_text = "\n\n".join(revision_lines)
 
+    coverage_summary = syllabus_coverage.get("summary", {}) if isinstance(syllabus_coverage, dict) else {}
     md_notes = f"# {title}\n\n**Summary:** {summary}\n\n"
     for n in notes:
         confidence_label = str(n.get('confidence_label', 'LOW')).upper()
@@ -2406,14 +3164,38 @@ if generated_result:
             f"**Reason:** {n.get('confidence_reason', '')}\n\n"
             f"{n.get('content', '')}\n\n"
         )
-        source_refs = n.get('source_refs', [])
-        if source_refs:
-            md_notes += f"**Source refs:** {', '.join(str(ref) for ref in source_refs)}\n\n"
+        references = n.get('references', []) if isinstance(n.get('references', []), list) else []
+        if references:
+            md_notes += "**Sources:**\n"
+            for ref in references:
+                start = format_timestamp(ref.get('start_sec', 0.0))
+                end = format_timestamp(ref.get('end_sec', ref.get('start_sec', 0.0)))
+                seg_id = ref.get('segment_id', 'unknown')
+                quote = ref.get('quote', '')
+                md_notes += f"- {start} to {end} ({seg_id})"
+                if quote:
+                    md_notes += f": {quote}"
+                md_notes += "\n"
+            md_notes += "\n"
 
     if exam_hints:
         md_notes += "## Exam Radar\n\n"
         for h in exam_hints:
             md_notes += f"- **[{h.get('urgency')}]** {h.get('hint')} *(Module: {h.get('module')})*\n"
+
+    if isinstance(syllabus_coverage, dict) and syllabus_coverage.get("modules"):
+        md_notes += "\n## Syllabus Coverage\n\n"
+        md_notes += (
+            f"Covered: {coverage_summary.get('covered', 0)} | "
+            f"Partial: {coverage_summary.get('partial', 0)} | "
+            f"Missing: {coverage_summary.get('missing', 0)}\n\n"
+        )
+        for row in syllabus_coverage.get("modules", []):
+            md_notes += (
+                f"- **{row.get('module_name', '')}**: "
+                f"{row.get('coverage_percent', 0)}% ({row.get('status', 'Missing')})"
+                f" | evidence={row.get('evidence_count', 0)}\n"
+            )
 
     safe_title = re.sub(r"[^a-zA-Z0-9_]", "_", title[:28])
 
