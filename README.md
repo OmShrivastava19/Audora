@@ -92,8 +92,11 @@ For OpenAI mode, use your paid OpenAI API key.
    - Clean Study Notes
    - Confidence score, label, and reason for every note
    - Exam Radar hints
+   - Study Practice tabs:
+     - Flashcards (reveal, previous/next, shuffle, known/review tracking)
+     - Quiz Mode (MCQ + short answer + true/false, configurable length, optional timer, scoring + retry wrong)
    - Raw transcript preview
-   - Downloads (`.md`, `.json` with confidence/source metadata, transcript `.txt`)
+   - Downloads (`.md`, notes `.json`, transcript `.txt`, flashcards `.json`, quiz `.json`, revision set `.txt`)
 
 ### OCR for Scanned Syllabus PDFs
 

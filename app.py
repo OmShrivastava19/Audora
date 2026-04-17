@@ -1,6 +1,8 @@
 import json
 import html
+import hashlib
 import os
+import random
 import re
 import tempfile
 import time
@@ -1232,6 +1234,771 @@ def flatten_notes(result: dict) -> str:
     return "\n\n".join(parts)
 
 
+def _notes_fingerprint(result: dict) -> str:
+    payload = json.dumps(result or {}, sort_keys=True, ensure_ascii=False)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+
+def _extract_any_json(raw: str):
+    if not isinstance(raw, str):
+        return {}
+    cleaned = re.sub(r"^```(?:json)?\s*", "", raw.strip())
+    cleaned = re.sub(r"\s*```$", "", cleaned)
+    try:
+        return json.loads(cleaned)
+    except Exception:
+        pass
+
+    match = re.search(r"\{.*\}", cleaned, re.DOTALL)
+    if not match:
+        return {}
+    try:
+        return json.loads(match.group(0))
+    except Exception:
+        return {}
+
+
+def _compact_notes_for_practice(result: dict, max_chars: int = 9000) -> str:
+    parts = []
+    summary = str(result.get("summary", "") or "").strip()
+    if summary:
+        parts.append(f"Summary: {summary[:900]}")
+
+    notes = result.get("notes", [])
+    if not isinstance(notes, list):
+        notes = []
+
+    for note in notes[:18]:
+        if not isinstance(note, dict):
+            continue
+        module = str(note.get("module", "General") or "General").strip()
+        content = str(note.get("content", "") or "").strip()
+        if not content:
+            continue
+        parts.append(f"Module: {module}\nKey content: {content[:700]}")
+
+    compact = "\n\n".join(parts).strip()
+    if len(compact) <= max_chars:
+        return compact
+    return compact[:max_chars]
+
+
+def build_practice_prompt_from_notes(structured_notes: dict) -> str:
+    """Build a compact prompt to generate flashcards and mixed quiz items from structured notes."""
+    title = str(structured_notes.get("title", "Lecture Notes") or "Lecture Notes")
+    language = str(structured_notes.get("language", "en") or "en")
+    modules = []
+    for note in structured_notes.get("notes", []):
+        if not isinstance(note, dict):
+            continue
+        module = str(note.get("module", "General") or "General").strip()
+        if module and module not in modules:
+            modules.append(module)
+    compact_notes = _compact_notes_for_practice(structured_notes)
+
+    return f"""
+You are a study practice generator.
+Create retrieval-practice content from the notes below.
+
+Rules:
+- Return JSON only.
+- Generate 10 to 30 flashcards.
+- Flashcard fields: question, answer, module, difficulty (easy|medium|hard).
+- Generate 20 quiz items with mixed types: mcq, short_answer, true_false.
+- Each quiz item fields: id, type, module, difficulty, question, explanation.
+- For mcq: include options (exactly 4) and correct_index (0-3).
+- For short_answer: include answer as concise expected answer.
+- For true_false: include answer as boolean true/false.
+- Keep wording precise, exam-focused, and grounded in source notes.
+
+Required output schema:
+{{
+  "metadata": {{
+    "title": "{title}",
+    "language": "{language}",
+    "generated_from_modules": {json.dumps(modules, ensure_ascii=False)}
+  }},
+  "flashcards": [{{"question": "...", "answer": "...", "module": "...", "difficulty": "easy"}}],
+  "quiz": [{{"id": "q1", "type": "mcq", "module": "...", "difficulty": "medium", "question": "...", "options": ["A", "B", "C", "D"], "correct_index": 0, "explanation": "..."}}]
+}}
+
+SOURCE NOTES:
+{compact_notes}
+""".strip()
+
+
+def generate_practice_with_groq(structured_notes: dict, groq_key: str) -> dict:
+    """Generate practice payload with Groq using notes JSON as source of truth."""
+    if not GROQ_OK:
+        raise RuntimeError("groq package not installed. Run: pip install groq")
+    if not groq_key:
+        raise ValueError("Groq API key missing.")
+
+    prompt = build_practice_prompt_from_notes(structured_notes)
+    client = Groq(api_key=groq_key)
+    response = client.chat.completions.create(
+        model="llama-3.3-70b-versatile",
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.1,
+        max_tokens=3200,
+    )
+    return _extract_any_json(response.choices[0].message.content.strip())
+
+
+def generate_practice_with_openai(structured_notes: dict, api_key: str) -> dict:
+    """Generate practice payload with OpenAI using notes JSON as source of truth."""
+    prompt = build_practice_prompt_from_notes(structured_notes)
+
+    if LANGCHAIN_OK:
+        llm = ChatOpenAI(
+            model="gpt-4o",
+            temperature=0.1,
+            max_tokens=3200,
+            openai_api_key=api_key,
+        )
+        messages = [
+            SystemMessage(content="Return valid JSON only."),
+            HumanMessage(content=prompt),
+        ]
+        response = llm.invoke(messages)
+        return _extract_any_json(response.content.strip())
+
+    if not OPENAI_OK:
+        raise RuntimeError("Neither langchain-openai nor openai package is available.")
+
+    client = openai.OpenAI(api_key=api_key)
+    response = client.chat.completions.create(
+        model="gpt-4o",
+        temperature=0.1,
+        messages=[
+            {"role": "system", "content": "Return valid JSON only."},
+            {"role": "user", "content": prompt},
+        ],
+    )
+    return _extract_any_json(response.choices[0].message.content.strip())
+
+
+def _fallback_practice_from_notes(notes_result: dict) -> dict:
+    notes = notes_result.get("notes", [])
+    if not isinstance(notes, list):
+        notes = []
+
+    modules = []
+    flashcards = []
+    quiz = []
+
+    for idx, note in enumerate(notes, start=1):
+        if not isinstance(note, dict):
+            continue
+        module = str(note.get("module", "General") or "General").strip() or "General"
+        content = str(note.get("content", "") or "").strip()
+        if not content:
+            continue
+        if module not in modules:
+            modules.append(module)
+
+        answer = content[:320]
+        flashcards.append(
+            {
+                "question": f"What is the key idea in {module}?",
+                "answer": answer,
+                "module": module,
+                "difficulty": "medium",
+            }
+        )
+
+        quiz.append(
+            {
+                "id": f"short_{idx}",
+                "type": "short_answer",
+                "module": module,
+                "difficulty": "medium",
+                "question": f"Summarize a core concept from {module}.",
+                "answer": answer,
+                "explanation": "Derived from generated notes.",
+            }
+        )
+        quiz.append(
+            {
+                "id": f"tf_{idx}",
+                "type": "true_false",
+                "module": module,
+                "difficulty": "easy",
+                "question": f"The notes include at least one examinable idea in {module}.",
+                "answer": True,
+                "explanation": "This statement reflects the extracted note content.",
+            }
+        )
+
+    if not flashcards:
+        flashcards = [
+            {
+                "question": "What is the main takeaway from this lecture?",
+                "answer": str(notes_result.get("summary", "Review the generated notes.") or "Review the generated notes."),
+                "module": "General",
+                "difficulty": "easy",
+            }
+        ]
+
+    for idx, card in enumerate(list(flashcards), start=1):
+        if len(quiz) >= 20:
+            break
+        answer = card.get("answer", "")
+        module = card.get("module", "General")
+        question = card.get("question", "")
+        options = [
+            f"{answer[:70]}",
+            "Only administrative announcements",
+            "No meaningful concepts discussed",
+            "No module-level information present",
+        ]
+        quiz.append(
+            {
+                "id": f"mcq_{idx}",
+                "type": "mcq",
+                "module": module,
+                "difficulty": "medium",
+                "question": f"Which option best matches this prompt: {question}",
+                "options": options,
+                "correct_index": 0,
+                "explanation": "Option A is grounded in the generated note content.",
+            }
+        )
+
+    return {
+        "metadata": {
+            "title": str(notes_result.get("title", "Lecture Notes") or "Lecture Notes"),
+            "language": str(notes_result.get("language", "en") or "en"),
+            "generated_from_modules": modules or ["General"],
+        },
+        "flashcards": flashcards[:30],
+        "quiz": quiz[:24],
+    }
+
+
+def parse_practice_payload(payload_raw, notes_result: dict) -> dict:
+    """Validate and normalize practice JSON payload with graceful fallback for malformed items."""
+    payload = payload_raw if isinstance(payload_raw, dict) else _extract_any_json(str(payload_raw))
+    if not isinstance(payload, dict):
+        payload = {}
+
+    fallback = _fallback_practice_from_notes(notes_result)
+    valid_difficulties = {"easy", "medium", "hard"}
+
+    flashcards = []
+    for item in payload.get("flashcards", []) if isinstance(payload.get("flashcards", []), list) else []:
+        if not isinstance(item, dict):
+            continue
+        question = str(item.get("question", "") or "").strip()
+        answer = str(item.get("answer", "") or "").strip()
+        module = str(item.get("module", "General") or "General").strip() or "General"
+        difficulty = str(item.get("difficulty", "medium") or "medium").strip().lower()
+        if difficulty not in valid_difficulties:
+            difficulty = "medium"
+        if not question or not answer:
+            continue
+        flashcards.append(
+            {
+                "question": question,
+                "answer": answer,
+                "module": module,
+                "difficulty": difficulty,
+            }
+        )
+        if len(flashcards) >= 30:
+            break
+
+    quiz = []
+    quiz_raw = payload.get("quiz", []) if isinstance(payload.get("quiz", []), list) else []
+    for idx, item in enumerate(quiz_raw, start=1):
+        if not isinstance(item, dict):
+            continue
+        q_type = str(item.get("type", "") or "").strip().lower()
+        q_type = "true_false" if q_type in {"truefalse", "true_false", "tf"} else q_type
+        if q_type not in {"mcq", "short_answer", "true_false"}:
+            continue
+
+        question = str(item.get("question", "") or "").strip()
+        module = str(item.get("module", "General") or "General").strip() or "General"
+        explanation = str(item.get("explanation", "Review this module concept.") or "Review this module concept.").strip()
+        difficulty = str(item.get("difficulty", "medium") or "medium").strip().lower()
+        if difficulty not in valid_difficulties:
+            difficulty = "medium"
+        if not question:
+            continue
+
+        normalized = {
+            "id": str(item.get("id", f"q{idx}") or f"q{idx}"),
+            "type": q_type,
+            "module": module,
+            "difficulty": difficulty,
+            "question": question,
+            "explanation": explanation,
+        }
+
+        if q_type == "mcq":
+            options = item.get("options", [])
+            if not isinstance(options, list):
+                continue
+            options = [str(opt).strip() for opt in options if str(opt).strip()]
+            if len(options) != 4:
+                continue
+            try:
+                correct_index = int(item.get("correct_index", -1))
+            except Exception:
+                correct_index = -1
+            if correct_index not in (0, 1, 2, 3):
+                continue
+            normalized["options"] = options
+            normalized["correct_index"] = correct_index
+        elif q_type == "short_answer":
+            answer = str(item.get("answer", "") or "").strip()
+            if not answer:
+                continue
+            normalized["answer"] = answer
+        else:
+            tf_value = item.get("answer", None)
+            if isinstance(tf_value, bool):
+                normalized["answer"] = tf_value
+            elif isinstance(tf_value, str):
+                lowered = tf_value.strip().lower()
+                if lowered in {"true", "t", "yes", "1"}:
+                    normalized["answer"] = True
+                elif lowered in {"false", "f", "no", "0"}:
+                    normalized["answer"] = False
+                else:
+                    continue
+            else:
+                continue
+
+        quiz.append(normalized)
+        if len(quiz) >= 24:
+            break
+
+    if len(flashcards) < 10:
+        for item in fallback["flashcards"]:
+            if len(flashcards) >= 10:
+                break
+            flashcards.append(item)
+
+    if len(quiz) < 10:
+        for item in fallback["quiz"]:
+            if len(quiz) >= 20:
+                break
+            quiz.append(item)
+
+    metadata = payload.get("metadata", {}) if isinstance(payload.get("metadata", {}), dict) else {}
+    generated_modules = metadata.get("generated_from_modules")
+    if not isinstance(generated_modules, list) or not generated_modules:
+        generated_modules = fallback["metadata"].get("generated_from_modules", ["General"])
+
+    return {
+        "metadata": {
+            "title": str(metadata.get("title", notes_result.get("title", "Lecture Notes")) or "Lecture Notes"),
+            "language": str(metadata.get("language", notes_result.get("language", "en")) or "en"),
+            "generated_from_modules": [str(module) for module in generated_modules][:30],
+        },
+        "flashcards": flashcards[:30],
+        "quiz": quiz[:24],
+    }
+
+
+def generate_practice_content_from_notes(structured_notes: dict, provider: str, api_key: str) -> dict:
+    """Generate and parse study practice content from existing notes using the active provider path."""
+    if provider == "groq":
+        raw_payload = generate_practice_with_groq(structured_notes, api_key)
+    elif provider == "openai":
+        raw_payload = generate_practice_with_openai(structured_notes, api_key)
+    else:
+        raise ValueError(f"Unsupported provider: {provider}")
+    return parse_practice_payload(raw_payload, structured_notes)
+
+
+def init_practice_state(practice_payload: dict, cache_key: str):
+    """Initialize or refresh practice-specific session state keyed by notes fingerprint."""
+    flashcards = practice_payload.get("flashcards", [])
+    quiz_bank = practice_payload.get("quiz", [])
+
+    if st.session_state.get("practice_cache_key") == cache_key:
+        st.session_state.setdefault("practice_flashcard_order", list(range(len(flashcards))))
+        st.session_state.setdefault("practice_flashcard_index", 0)
+        st.session_state.setdefault("practice_flashcard_revealed", {})
+        st.session_state.setdefault("practice_flashcard_marks", {})
+        st.session_state.setdefault("quiz_active_ids", [])
+        st.session_state.setdefault("quiz_submitted", False)
+        st.session_state.setdefault("quiz_last_result", None)
+        st.session_state.setdefault("quiz_timer_started_at", None)
+        return
+
+    st.session_state["practice_cache_key"] = cache_key
+    st.session_state["practice_flashcard_order"] = list(range(len(flashcards)))
+    st.session_state["practice_flashcard_index"] = 0
+    st.session_state["practice_flashcard_revealed"] = {}
+    st.session_state["practice_flashcard_marks"] = {}
+
+    default_length = 10 if len(quiz_bank) >= 10 else min(5, len(quiz_bank))
+    st.session_state["quiz_length"] = default_length
+    st.session_state["quiz_timer_enabled"] = False
+    st.session_state["quiz_timer_minutes"] = 10
+    st.session_state["quiz_timer_started_at"] = None
+    st.session_state["quiz_submitted"] = False
+    st.session_state["quiz_last_result"] = None
+    st.session_state["quiz_active_ids"] = list(range(default_length))
+
+
+def render_flashcards_ui(practice_payload: dict):
+    """Render flashcard practice with reveal, navigation, shuffle, and known/review tracking."""
+    flashcards = practice_payload.get("flashcards", [])
+    if not flashcards:
+        st.info("No flashcards available for this lecture yet.")
+        return
+
+    order = st.session_state.get("practice_flashcard_order", list(range(len(flashcards))))
+    if len(order) != len(flashcards):
+        order = list(range(len(flashcards)))
+        st.session_state["practice_flashcard_order"] = order
+
+    index = int(st.session_state.get("practice_flashcard_index", 0) or 0)
+    index = max(0, min(index, len(order) - 1))
+    st.session_state["practice_flashcard_index"] = index
+
+    marks = st.session_state.get("practice_flashcard_marks", {})
+    known_count = sum(1 for value in marks.values() if value == "known")
+    review_count = sum(1 for value in marks.values() if value == "review")
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Total", len(flashcards))
+    c2.metric("Known", known_count)
+    c3.metric("Review", review_count)
+
+    ctl1, ctl2, ctl3 = st.columns([1.3, 1.3, 2])
+    with ctl1:
+        if st.button("Shuffle", key="practice_shuffle_flashcards", use_container_width=True):
+            shuffled = list(range(len(flashcards)))
+            random.shuffle(shuffled)
+            st.session_state["practice_flashcard_order"] = shuffled
+            st.session_state["practice_flashcard_index"] = 0
+            st.rerun()
+    with ctl2:
+        if st.button("Reset Marks", key="practice_reset_flashcards", use_container_width=True):
+            st.session_state["practice_flashcard_marks"] = {}
+            st.rerun()
+    with ctl3:
+        st.caption(f"Card {index + 1} of {len(flashcards)}")
+
+    current_id = order[index]
+    card = flashcards[current_id]
+    revealed_map = st.session_state.get("practice_flashcard_revealed", {})
+    is_revealed = bool(revealed_map.get(current_id, False))
+
+    st.markdown(
+        f"<div class='card'>"
+        f"<span class='rbadge rbadge-mod'>{html.escape(str(card.get('module', 'General')))}</span>"
+        f"<span class='rbadge rbadge-med'>{html.escape(str(card.get('difficulty', 'medium')).upper())}</span>"
+        f"<p style='margin-top:0.75rem;font-size:1.02rem;font-weight:600;'>{html.escape(str(card.get('question', '')))}</p>"
+        f"</div>",
+        unsafe_allow_html=True,
+    )
+
+    reveal_label = "Hide Answer" if is_revealed else "Reveal Answer"
+    if st.button(reveal_label, key="practice_reveal_toggle", use_container_width=True):
+        revealed_map[current_id] = not is_revealed
+        st.session_state["practice_flashcard_revealed"] = revealed_map
+        st.rerun()
+
+    if is_revealed:
+        st.markdown(
+            f"<div class='card card-green'><div class='section-label'>Answer</div><p style='margin:0;line-height:1.7'>{html.escape(str(card.get('answer', '')))}</p></div>",
+            unsafe_allow_html=True,
+        )
+
+    mark_col1, mark_col2 = st.columns(2)
+    with mark_col1:
+        if st.button("Mark as Known", key="practice_mark_known", use_container_width=True):
+            marks[current_id] = "known"
+            st.session_state["practice_flashcard_marks"] = marks
+            st.rerun()
+    with mark_col2:
+        if st.button("Mark as Review", key="practice_mark_review", use_container_width=True):
+            marks[current_id] = "review"
+            st.session_state["practice_flashcard_marks"] = marks
+            st.rerun()
+
+    nav1, nav2 = st.columns(2)
+    with nav1:
+        if st.button("Previous", key="practice_prev_flashcard", use_container_width=True, disabled=index <= 0):
+            st.session_state["practice_flashcard_index"] = max(0, index - 1)
+            st.rerun()
+    with nav2:
+        if st.button("Next", key="practice_next_flashcard", use_container_width=True, disabled=index >= len(order) - 1):
+            st.session_state["practice_flashcard_index"] = min(len(order) - 1, index + 1)
+            st.rerun()
+
+
+def _normalize_answer_text(value: str) -> str:
+    text = str(value or "").lower()
+    text = re.sub(r"[^a-z0-9\s]", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+def _is_short_answer_correct(expected: str, user_answer: str) -> bool:
+    expected_norm = _normalize_answer_text(expected)
+    user_norm = _normalize_answer_text(user_answer)
+    if not expected_norm or not user_norm:
+        return False
+    if expected_norm in user_norm or user_norm in expected_norm:
+        return True
+    expected_terms = {term for term in expected_norm.split(" ") if len(term) > 2}
+    user_terms = {term for term in user_norm.split(" ") if len(term) > 2}
+    if not expected_terms or not user_terms:
+        return False
+    overlap = len(expected_terms & user_terms)
+    return (overlap / max(1, len(expected_terms))) >= 0.5
+
+
+def _quiz_answer_to_text(question: dict, answer_value) -> str:
+    q_type = question.get("type")
+    if q_type == "mcq":
+        try:
+            idx = int(answer_value)
+        except Exception:
+            return "No answer"
+        options = question.get("options", [])
+        if isinstance(options, list) and 0 <= idx < len(options):
+            return str(options[idx])
+        return "No answer"
+    if q_type == "true_false":
+        return "True" if bool(answer_value) else "False"
+    value = str(answer_value or "").strip()
+    return value if value else "No answer"
+
+
+def _quiz_correct_answer_text(question: dict) -> str:
+    q_type = question.get("type")
+    if q_type == "mcq":
+        options = question.get("options", [])
+        idx = int(question.get("correct_index", 0) or 0)
+        if isinstance(options, list) and 0 <= idx < len(options):
+            return str(options[idx])
+        return "Unknown"
+    if q_type == "true_false":
+        return "True" if bool(question.get("answer", False)) else "False"
+    return str(question.get("answer", "")).strip() or "Unknown"
+
+
+def render_quiz_ui(practice_payload: dict):
+    """Render mixed quiz with configurable length, timer option, scoring, and retry-wrong flow."""
+    quiz_bank = practice_payload.get("quiz", [])
+    if not quiz_bank:
+        st.info("No quiz questions available for this lecture yet.")
+        return
+
+    available_lengths = [option for option in (5, 10, 20) if option <= len(quiz_bank)]
+    if not available_lengths:
+        available_lengths = [len(quiz_bank)]
+
+    selected_length = st.selectbox(
+        "Quiz length",
+        options=available_lengths,
+        index=available_lengths.index(st.session_state.get("quiz_length", available_lengths[0]))
+        if st.session_state.get("quiz_length", available_lengths[0]) in available_lengths
+        else 0,
+        key="quiz_length_selector",
+    )
+    st.session_state["quiz_length"] = selected_length
+
+    timer_enabled = st.checkbox("Enable timer", value=bool(st.session_state.get("quiz_timer_enabled", False)), key="quiz_timer_toggle")
+    st.session_state["quiz_timer_enabled"] = timer_enabled
+
+    if timer_enabled:
+        minutes = st.number_input(
+            "Quiz timer (minutes)",
+            min_value=1,
+            max_value=120,
+            value=int(st.session_state.get("quiz_timer_minutes", 10) or 10),
+            step=1,
+            key="quiz_timer_minutes_input",
+        )
+        st.session_state["quiz_timer_minutes"] = int(minutes)
+
+    active_ids = st.session_state.get("quiz_active_ids", [])
+    if (
+        not isinstance(active_ids, list)
+        or len(active_ids) != selected_length
+        or any((not isinstance(i, int) or i < 0 or i >= len(quiz_bank)) for i in active_ids)
+    ):
+        active_ids = random.sample(list(range(len(quiz_bank))), k=selected_length)
+        st.session_state["quiz_active_ids"] = active_ids
+        st.session_state["quiz_submitted"] = False
+        st.session_state["quiz_last_result"] = None
+
+    action_col1, action_col2 = st.columns(2)
+    with action_col1:
+        if st.button("New Quiz Set", key="quiz_new_set", use_container_width=True):
+            st.session_state["quiz_active_ids"] = random.sample(list(range(len(quiz_bank))), k=selected_length)
+            st.session_state["quiz_submitted"] = False
+            st.session_state["quiz_last_result"] = None
+            st.session_state["quiz_timer_started_at"] = None
+            st.rerun()
+    with action_col2:
+        if timer_enabled:
+            if st.button("Start Timer", key="quiz_start_timer", use_container_width=True):
+                st.session_state["quiz_timer_started_at"] = time.time()
+                st.rerun()
+
+    if timer_enabled and st.session_state.get("quiz_timer_started_at"):
+        elapsed = int(time.time() - st.session_state["quiz_timer_started_at"])
+        total_seconds = int(st.session_state.get("quiz_timer_minutes", 10) * 60)
+        remaining = max(0, total_seconds - elapsed)
+        minutes_left = remaining // 60
+        seconds_left = remaining % 60
+        st.caption(f"Time remaining: {minutes_left:02d}:{seconds_left:02d}")
+        if remaining <= 0 and not st.session_state.get("quiz_submitted", False):
+            st.warning("Timer ended. Submit now to score this attempt.")
+
+    for q_no, qid in enumerate(st.session_state.get("quiz_active_ids", []), start=1):
+        question = quiz_bank[qid]
+        q_type = question.get("type")
+        q_key = f"quiz_answer_{qid}"
+        module = str(question.get("module", "General") or "General")
+        difficulty = str(question.get("difficulty", "medium") or "medium").upper()
+
+        st.markdown(
+            f"<div class='card'>"
+            f"<div class='section-label'>Question {q_no}</div>"
+            f"<span class='rbadge rbadge-mod'>{html.escape(module)}</span>"
+            f"<span class='rbadge rbadge-med'>{html.escape(difficulty)}</span>"
+            f"<p style='margin-top:0.75rem;font-weight:600'>{html.escape(str(question.get('question', '')))}</p>"
+            f"</div>",
+            unsafe_allow_html=True,
+        )
+
+        if q_type == "mcq":
+            options = question.get("options", [])
+            st.radio(
+                f"Select answer for question {q_no}",
+                options=list(range(len(options))),
+                format_func=lambda i: options[i],
+                key=q_key,
+                horizontal=False,
+                index=None,
+            )
+        elif q_type == "true_false":
+            st.radio(
+                f"True/False for question {q_no}",
+                options=[True, False],
+                format_func=lambda v: "True" if v else "False",
+                key=q_key,
+                index=None,
+                horizontal=True,
+            )
+        else:
+            st.text_input(
+                f"Your short answer for question {q_no}",
+                key=q_key,
+                placeholder="Type your answer...",
+            )
+
+    if st.button("Submit Quiz", key="quiz_submit", use_container_width=True):
+        score = 0
+        wrong_items = []
+        module_stats = {}
+
+        for qid in st.session_state.get("quiz_active_ids", []):
+            question = quiz_bank[qid]
+            q_type = question.get("type")
+            q_key = f"quiz_answer_{qid}"
+            user_answer = st.session_state.get(q_key)
+
+            is_correct = False
+            if q_type == "mcq":
+                is_correct = isinstance(user_answer, int) and user_answer == question.get("correct_index")
+            elif q_type == "true_false":
+                is_correct = user_answer is not None and bool(user_answer) == bool(question.get("answer"))
+            else:
+                is_correct = _is_short_answer_correct(str(question.get("answer", "")), str(user_answer or ""))
+
+            module = str(question.get("module", "General") or "General")
+            stats = module_stats.setdefault(module, {"correct": 0, "total": 0})
+            stats["total"] += 1
+
+            if is_correct:
+                score += 1
+                stats["correct"] += 1
+            else:
+                wrong_items.append(
+                    {
+                        "id": qid,
+                        "module": module,
+                        "question": question.get("question", ""),
+                        "your_answer": _quiz_answer_to_text(question, user_answer),
+                        "correct_answer": _quiz_correct_answer_text(question),
+                        "explanation": question.get("explanation", "Review this concept in notes."),
+                    }
+                )
+
+        total = len(st.session_state.get("quiz_active_ids", []))
+        accuracy = round((score / total) * 100, 2) if total else 0.0
+        per_module = []
+        for module, stats in module_stats.items():
+            module_accuracy = round((stats["correct"] / max(1, stats["total"])) * 100, 2)
+            per_module.append(
+                {
+                    "module": module,
+                    "score": f"{stats['correct']}/{stats['total']}",
+                    "accuracy_percent": module_accuracy,
+                }
+            )
+
+        st.session_state["quiz_submitted"] = True
+        st.session_state["quiz_last_result"] = {
+            "score": score,
+            "total": total,
+            "accuracy": accuracy,
+            "per_module": per_module,
+            "wrong_items": wrong_items,
+        }
+        st.rerun()
+
+    if st.session_state.get("quiz_submitted") and st.session_state.get("quiz_last_result"):
+        result = st.session_state["quiz_last_result"]
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Score", f"{result['score']}/{result['total']}")
+        m2.metric("Accuracy", f"{result['accuracy']:.2f}%")
+        m3.metric("Wrong", len(result.get("wrong_items", [])))
+
+        st.markdown("#### Per-module performance")
+        st.dataframe(result.get("per_module", []), use_container_width=True)
+
+        wrong_items = result.get("wrong_items", [])
+        if wrong_items:
+            st.markdown("#### Wrong answers with explanations")
+            for item in wrong_items:
+                st.markdown(
+                    f"<div class='card card-red'>"
+                    f"<span class='rbadge rbadge-mod'>{html.escape(str(item.get('module', 'General')))}</span>"
+                    f"<p style='margin-top:0.6rem;font-weight:600'>{html.escape(str(item.get('question', '')))}</p>"
+                    f"<p style='margin:0.4rem 0 0;'><strong>Your answer:</strong> {html.escape(str(item.get('your_answer', 'No answer')))}</p>"
+                    f"<p style='margin:0.2rem 0 0;'><strong>Correct answer:</strong> {html.escape(str(item.get('correct_answer', 'Unknown')))}</p>"
+                    f"<p style='margin:0.35rem 0 0;color:#7b82a0;'>{html.escape(str(item.get('explanation', 'Review this module concept.')))}</p>"
+                    f"</div>",
+                    unsafe_allow_html=True,
+                )
+
+            if st.button("Retry Wrong Questions", key="quiz_retry_wrong", use_container_width=True):
+                wrong_ids = [int(item["id"]) for item in wrong_items if str(item.get("id", "")).isdigit()]
+                if not wrong_ids:
+                    wrong_ids = [item["id"] for item in wrong_items if isinstance(item.get("id"), int)]
+                st.session_state["quiz_active_ids"] = wrong_ids[: max(1, min(len(wrong_ids), 20))]
+                st.session_state["quiz_submitted"] = False
+                st.session_state["quiz_last_result"] = None
+                st.session_state["quiz_timer_started_at"] = time.time() if st.session_state.get("quiz_timer_enabled") else None
+                st.rerun()
+        else:
+            st.success("Perfect run. No wrong answers to retry.")
+
+
 with st.sidebar:
     st.markdown('<div class="audora-wordmark-sidebar">AUDORA</div>', unsafe_allow_html=True)
     st.markdown(
@@ -1385,6 +2152,7 @@ elif not audio_file:
 if run_button and can_run:
     result = {}
     transcript = ""
+    practice_payload = None
     progress = st.progress(0, text="Starting pipeline...")
 
     vector_store = None
@@ -1458,6 +2226,13 @@ if run_button and can_run:
             st.code(traceback.format_exc())
         st.stop()
 
+    progress.progress(86, text="Generating study practice...")
+    try:
+        practice_payload = generate_practice_content_from_notes(result, provider, api_key)
+    except Exception as e:
+        st.warning(f"Practice generation failed. Showing notes normally. Details: {e}")
+        practice_payload = parse_practice_payload({}, result)
+
     _, tts_lang = LANGUAGES[selected_language]
     audio_out = b""
     if enable_tts and GTTS_OK:
@@ -1465,6 +2240,40 @@ if run_button and can_run:
         audio_out = notes_to_speech(flatten_notes(result), tts_lang)
 
     progress.progress(100, text="Done")
+
+    st.session_state["audora_result"] = result
+    st.session_state["audora_transcript"] = transcript
+    st.session_state["audora_audio_out"] = audio_out
+    st.session_state["audora_provider"] = provider
+    st.session_state["audora_language"] = selected_language
+
+    practice_key = _notes_fingerprint(result)
+    st.session_state["practice_payload"] = practice_payload
+    st.session_state["practice_payload_key"] = practice_key
+    init_practice_state(practice_payload, practice_key)
+
+generated_result = st.session_state.get("audora_result")
+if generated_result:
+    result = generated_result
+    transcript = st.session_state.get("audora_transcript", "")
+    audio_out = st.session_state.get("audora_audio_out", b"")
+    provider_used = st.session_state.get("audora_provider", provider)
+    language_used = st.session_state.get("audora_language", selected_language)
+
+    practice_key = _notes_fingerprint(result)
+    practice_payload = st.session_state.get("practice_payload")
+    if st.session_state.get("practice_payload_key") != practice_key or not isinstance(practice_payload, dict):
+        try:
+            practice_payload = generate_practice_content_from_notes(result, provider_used, api_key)
+            st.session_state["practice_payload"] = practice_payload
+            st.session_state["practice_payload_key"] = practice_key
+        except Exception as e:
+            st.warning(f"Practice generation failed. Showing notes normally. Details: {e}")
+            practice_payload = parse_practice_payload({}, result)
+            st.session_state["practice_payload"] = practice_payload
+            st.session_state["practice_payload_key"] = practice_key
+
+    init_practice_state(practice_payload, practice_key)
 
     st.divider()
 
@@ -1480,8 +2289,8 @@ if run_button and can_run:
     )
 
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Provider", "Groq" if provider == "groq" else "OpenAI")
-    c2.metric("Language", selected_language)
+    c1.metric("Provider", "Groq" if provider_used == "groq" else "OpenAI")
+    c2.metric("Language", language_used)
     c3.metric("Noise Removed", filtered_count)
     c4.metric("Exam Hints", len(exam_hints))
 
@@ -1570,7 +2379,22 @@ if run_button and can_run:
             )
 
     st.divider()
-    dl1, dl2, dl3, _ = st.columns([2, 2, 2, 1])
+    st.markdown('<div class="section-label">Study Practice</div>', unsafe_allow_html=True)
+    practice_tab1, practice_tab2 = st.tabs(["Flashcards", "Quiz"])
+
+    with practice_tab1:
+        render_flashcards_ui(practice_payload)
+    with practice_tab2:
+        render_quiz_ui(practice_payload)
+
+    st.divider()
+    dl1, dl2, dl3 = st.columns(3)
+
+    flashcards_json = json.dumps(practice_payload.get("flashcards", []), indent=2, ensure_ascii=False)
+    quiz_json = json.dumps(practice_payload.get("quiz", []), indent=2, ensure_ascii=False)
+
+    revision_lines = [f"{idx}. Q: {card.get('question', '')}\nA: {card.get('answer', '')}" for idx, card in enumerate(practice_payload.get("flashcards", []), start=1)]
+    revision_text = "\n\n".join(revision_lines)
 
     md_notes = f"# {title}\n\n**Summary:** {summary}\n\n"
     for n in notes:
@@ -1616,6 +2440,34 @@ if run_button and can_run:
             "Download Transcript",
             data=transcript,
             file_name=f"transcript_{safe_title}.txt",
+            mime="text/plain",
+            use_container_width=True,
+        )
+
+    dl4, dl5, dl6 = st.columns(3)
+    with dl4:
+        st.download_button(
+            "Download Flashcards JSON",
+            data=flashcards_json,
+            file_name=f"flashcards_{safe_title}.json",
+            mime="application/json",
+            use_container_width=True,
+        )
+
+    with dl5:
+        st.download_button(
+            "Download Quiz JSON",
+            data=quiz_json,
+            file_name=f"quiz_{safe_title}.json",
+            mime="application/json",
+            use_container_width=True,
+        )
+
+    with dl6:
+        st.download_button(
+            "Download Revision Set",
+            data=revision_text,
+            file_name=f"revision_set_{safe_title}.txt",
             mime="text/plain",
             use_container_width=True,
         )
