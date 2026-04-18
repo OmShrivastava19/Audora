@@ -15,3 +15,6 @@ gTTS>=2.3.2
 pydub>=0.25.1
 streamlit>=1.35.0
 python-dotenv>=1.0.0
+firebase-admin>=6.5.0
+streamlit-cookies-controller>=0.0.3
+httpx-oauth>=0.14.0

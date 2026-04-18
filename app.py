@@ -11,6 +11,8 @@ from io import BytesIO
 from pathlib import Path
 
 import streamlit as st
+from streamlit_cookies_controller import CookieController
+import auth_utils
 
 try:
     from dotenv import load_dotenv
@@ -302,6 +304,117 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded",
 )
+
+# --- Authentication & Session Management ---
+auth_utils.init_session_state()
+
+# --- Handle Google OAuth Callback FIRST (before CookieController which triggers reruns) ---
+if "code" in st.query_params and not st.session_state.auth.get("is_authenticated") and not st.session_state.get("_oauth_done"):
+    try:
+        code = st.query_params["code"]
+        redirect_uri = auth_utils.get_redirect_uri()
+        id_token = auth_utils.exchange_google_code_for_id_token(code, redirect_uri)
+        data = auth_utils.sign_in_with_google_id_token(id_token)
+        
+        st.session_state.auth["is_authenticated"] = True
+        st.session_state.auth["uid"] = data["localId"]
+        st.session_state.auth["email"] = data.get("email", "")
+        st.session_state.auth["id_token"] = data["idToken"]
+        st.session_state.auth["refresh_token"] = data["refreshToken"]
+        st.session_state.auth["expires_at"] = time.time() + int(data["expiresIn"])
+        st.session_state["_oauth_done"] = True
+        
+    except Exception as e:
+        st.session_state["_oauth_done"] = True
+        st.error(f"Google Sign In Failed: {e}")
+
+# Clean URL bar via JavaScript (no Streamlit rerun triggered)
+if "code" in st.query_params:
+    import streamlit.components.v1 as _components
+    _components.html(
+        '<script>window.parent.history.replaceState({}, "", window.parent.location.pathname);</script>',
+        height=0,
+    )
+
+# Now initialize CookieController (may trigger rerun, but OAuth is already done)
+cookies_controller = CookieController()
+
+# Try to restore session from cookie (for returning users / page refreshes)
+if not st.session_state.auth.get("is_authenticated"):
+    refresh_token = cookies_controller.get("refresh_token")
+    if refresh_token:
+        st.session_state.auth["refresh_token"] = refresh_token
+        auth_utils.refresh_token_if_needed(cookies_controller)
+
+# Set cookie if we just authenticated via OAuth (deferred because CookieController wasn't ready earlier)
+if st.session_state.get("_oauth_done") and st.session_state.auth.get("refresh_token") and not st.session_state.get("_oauth_cookie_set"):
+    cookies_controller.set("refresh_token", st.session_state.auth["refresh_token"], max_age=30*24*60*60)
+    st.session_state["_oauth_cookie_set"] = True
+
+
+if not st.session_state.auth.get("is_authenticated"):
+    st.markdown(
+        """
+        <div style="text-align: center; margin-top: 3rem; margin-bottom: 2rem;">
+            <h1 style="font-family: 'Syne', sans-serif; font-size: 4rem; background: linear-gradient(135deg, #4fffb0 0%, #00c4ff 100%); -webkit-background-clip: text; -webkit-text-fill-color: transparent;">AUDORA</h1>
+            <p style="font-size: 1.2rem; color: #7b82a0; font-family: 'DM Mono', monospace;">Curriculum Grounded AI for Automated Lecture Synthesis</p>
+        </div>
+        """, unsafe_allow_html=True
+    )
+    
+    col1, col2, col3 = st.columns([1, 2, 1])
+    with col2:
+        st.markdown("<div class='card' style='padding: 2rem;'>", unsafe_allow_html=True)
+        tab1, tab2 = st.tabs(["Login", "Register"])
+        
+        with tab1:
+            st.markdown("### Welcome Back")
+            login_email = st.text_input("Email", key="login_email")
+            login_password = st.text_input("Password", type="password", key="login_pass")
+            if st.button("Log In", use_container_width=True):
+                try:
+                    data = auth_utils.sign_in_email_password(login_email, login_password)
+                    st.session_state.auth["is_authenticated"] = True
+                    st.session_state.auth["uid"] = data["localId"]
+                    st.session_state.auth["email"] = data.get("email", login_email)
+                    st.session_state.auth["id_token"] = data["idToken"]
+                    st.session_state.auth["refresh_token"] = data["refreshToken"]
+                    st.session_state.auth["expires_at"] = time.time() + int(data["expiresIn"])
+                    cookies_controller.set("refresh_token", data["refreshToken"], max_age=30*24*60*60)
+                    st.success("Logged in successfully!")
+                    time.sleep(0.5)
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Login failed: {str(e)}")
+            
+            google_auth_url = auth_utils.get_google_auth_url(auth_utils.get_redirect_uri())
+            if google_auth_url:
+                st.markdown("<div style='text-align: center; margin: 1rem 0; color: #7b82a0;'>or</div>", unsafe_allow_html=True)
+                st.markdown(f'<a href="{google_auth_url}" target="_self" style="display: block; text-align: center; padding: 0.65rem 2rem; background: #fff; color: #0d0f14; border-radius: 8px; font-weight: bold; text-decoration: none; font-family: \'Syne\', sans-serif;">Sign in with Google</a>', unsafe_allow_html=True)
+                    
+        with tab2:
+            st.markdown("### Create Account")
+            reg_email = st.text_input("Email", key="reg_email")
+            reg_password = st.text_input("Password", type="password", key="reg_pass")
+            if st.button("Sign Up", use_container_width=True):
+                try:
+                    data = auth_utils.sign_up_email_password(reg_email, reg_password)
+                    st.session_state.auth["is_authenticated"] = True
+                    st.session_state.auth["uid"] = data["localId"]
+                    st.session_state.auth["email"] = data.get("email", reg_email)
+                    st.session_state.auth["id_token"] = data["idToken"]
+                    st.session_state.auth["refresh_token"] = data["refreshToken"]
+                    st.session_state.auth["expires_at"] = time.time() + int(data["expiresIn"])
+                    cookies_controller.set("refresh_token", data["refreshToken"], max_age=30*24*60*60)
+                    st.success("Account created successfully!")
+                    time.sleep(0.5)
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Sign up failed: {str(e)}")
+        
+        st.markdown("</div>", unsafe_allow_html=True)
+    st.stop()
+# --- End Authentication & Session Management ---
 
 st.markdown(
     """
@@ -2754,7 +2867,20 @@ with st.sidebar:
         '<div class="audora-tagline">Curriculum Grounded AI for Automated Lecture Synthesis</div>',
         unsafe_allow_html=True,
     )
+    
+    # --- Auth Profile ---
     st.divider()
+    user_email = st.session_state.auth.get("email", "Unknown User")
+    uid = st.session_state.auth.get("uid")
+    plan, used = auth_utils.get_user_plan_info(uid)
+    
+    st.markdown(f"**User:** {user_email}")
+    st.markdown(f"**Plan:** {plan.capitalize()} | **Generations:** {used}")
+    if st.button("Log Out", use_container_width=True):
+        auth_utils.logout_user(cookies_controller)
+        
+    st.divider()
+    # --- End Auth Profile ---
 
     st.markdown("### Model Provider")
     provider_label = st.radio(
@@ -2899,6 +3025,11 @@ elif not audio_file:
     st.info("Upload a lecture recording to continue.")
 
 if run_button and can_run:
+    auth_utils.require_auth_guard(cookies_controller)
+    uid = st.session_state.auth.get("uid")
+    if uid:
+        auth_utils.increment_usage(uid)
+        
     result = {}
     transcript = ""
     transcript_segments = []
