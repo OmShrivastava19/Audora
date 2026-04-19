@@ -390,7 +390,7 @@ if not st.session_state.auth.get("is_authenticated"):
             google_auth_url = auth_utils.get_google_auth_url(auth_utils.get_redirect_uri())
             if google_auth_url:
                 st.markdown("<div style='text-align: center; margin: 1rem 0; color: #7b82a0;'>or</div>", unsafe_allow_html=True)
-                st.markdown(f'<a href="{google_auth_url}" target="_self" style="display: block; text-align: center; padding: 0.65rem 2rem; background: #fff; color: #0d0f14; border-radius: 8px; font-weight: bold; text-decoration: none; font-family: \'Syne\', sans-serif;">Sign in with Google</a>', unsafe_allow_html=True)
+                st.markdown(f'<a href="{google_auth_url}" target="_top" rel="noopener noreferrer" style="display: block; text-align: center; padding: 0.65rem 2rem; background: #fff; color: #0d0f14; border-radius: 8px; font-weight: bold; text-decoration: none; font-family: \'Syne\', sans-serif;">Sign in with Google</a>', unsafe_allow_html=True)
                     
         with tab2:
             st.markdown("### Create Account")
