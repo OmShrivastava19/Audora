@@ -1,20 +1,22 @@
 # Audora 🎓
 
-Syllabus-aware lecture intelligence with one unified Streamlit app and dual model providers.
+Curriculum-grounded AI for automated lecture synthesis. React frontend + FastAPI backend.
 
 Audora turns lecture audio/video into clean study notes, maps content to your syllabus modules, flags exam hints, and can read notes back as audio.
 
 ## ✨ Stack (Unified)
 
-- Free mode (Groq): **Groq Whisper + Groq LLaMA 3.3 70B**
-- Paid mode (OpenAI): **OpenAI Whisper + GPT-4o**
+   - **Backend**: FastAPI + Python
+   - **Frontend**: React + TypeScript + Tailwind CSS + Vite
+   - **Transcription**: Groq Whisper or OpenAI Whisper
+   - **LLM**: Groq LLaMA 3.3 70B or OpenAI GPT-4o
 - Syllabus retrieval:
    - Groq mode: **Sentence-Transformers + FAISS (local)**
    - OpenAI mode: **OpenAI Embeddings + FAISS (LangChain)**
 - PDF extraction: **PyPDF2 + OCR fallback for scanned PDFs**
 - OCR stack: **pypdfium2 + pytesseract + Pillow**
 - Audio notes (TTS): **gTTS**
-- UI: **Streamlit**
+   - Authentication: **Firebase** (email/password + Google OAuth)
 
 ## 🚀 Quick Start
 
@@ -25,29 +27,39 @@ git clone https://github.com/OmShrivastava19/Audora.git
 cd Audora
 ```
 
-2. Create + activate virtualenv:
+2. Configure environment:
 
 ```bash
+# Copy and fill in your API keys
+cp .env.example .env
+# Edit .env with your Firebase, Groq, and OpenAI keys
+```
+
+3. Start the backend:
+
+```bash
+# Create virtual environment
 python -m venv .venv
 
-# Windows PowerShell
+# Activate (Windows PowerShell)
 .venv\Scripts\Activate.ps1
 
-# macOS/Linux
+# Or (macOS/Linux)
 source .venv/bin/activate
+
+# Install backend dependencies
+pip install -r backend/requirements.txt
+
+# Start backend server (runs on http://localhost:8000)
+python -m uvicorn backend.main:app --reload
 ```
 
-3. Install dependencies:
+4. Start the frontend (in another terminal):
 
 ```bash
-pip install -r requirements.txt
-```
-
-4. Set key for your preferred mode (or paste in sidebar):
-
-```bash
-# Windows PowerShell (Groq free mode)
-$env:GROQ_API_KEY="gsk_..."
+cd frontend
+npm install  # If not already installed
+npm run dev   # Runs on http://localhost:8501
 
 # Windows PowerShell (OpenAI paid mode)
 $env:OPENAI_API_KEY="sk-..."
@@ -59,22 +71,10 @@ export GROQ_API_KEY="gsk_..."
 export OPENAI_API_KEY="sk-..."
 ```
 
-5. Run:
+5. Open the app:
 
-```bash
-streamlit run app.py
-```
-
-## 🔑 Provider Toggle
-
-In the sidebar, choose:
-
-- **Groq (Free)** for no-cost transcription + note generation
-- **OpenAI (Paid)** for Whisper + GPT-4o workflow
-
-The app runs from one entrypoint: `app.py`.
-
-`audora.py` is now a lightweight compatibility shim that loads `app.py`.
+- Frontend: http://localhost:8501
+- Backend API: http://localhost:8000
 
 ## 🔑 API Key
 
@@ -181,7 +181,6 @@ If OCR dependencies are missing, the app continues gracefully and shows a warnin
 - `Pillow`
 - `gTTS`
 - `pydub`
-- `streamlit`
 - `python-dotenv`
 
 ## ⚠️ Limits / Notes
@@ -198,7 +197,7 @@ If OCR dependencies are missing, the app continues gracefully and shows a warnin
 
 - Groq mode: syllabus embedding + retrieval run locally, and AI steps are sent to Groq over HTTPS.
 - OpenAI mode: transcription and LLM calls are sent to OpenAI over HTTPS.
-- Keys are read from env/Streamlit input and not persisted by app logic.
+- Keys are read from env or entered in the UI session and not persisted by app logic.
 
 ## 📄 License
 

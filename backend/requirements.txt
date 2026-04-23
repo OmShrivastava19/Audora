@@ -1,0 +1,36 @@
+# Audora Backend Dependencies
+# Core API
+fastapi>=0.104.0
+uvicorn[standard]>=0.24.0
+python-multipart>=0.0.6
+
+# LLM and NLP
+groq>=0.9.0
+openai>=1.50.0
+langchain>=0.3.0
+langchain-openai>=0.2.0
+langchain-community>=0.3.0
+langchain-text-splitters>=0.3.0
+sentence-transformers>=2.7.0
+faiss-cpu>=1.7.4
+
+# Data processing
+numpy>=1.24.0
+PyPDF2>=3.0.0
+pypdfium2>=4.30.0
+pytesseract>=0.3.10
+Pillow>=10.0.0
+pydub>=0.25.1
+
+# Audio
+gTTS>=2.3.2
+
+# Environment and configuration
+python-dotenv>=1.0.0
+
+# Authentication and database
+firebase-admin>=6.5.0
+
+# Optional: Database ORM (for future persistence)
+# sqlalchemy>=2.0.0
+# alembic>=1.13.0
